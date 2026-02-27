@@ -140,6 +140,18 @@ def _read_head(path: str, n: int = 256) -> bytes:
         return b""
 
 
+def _h5_keys_preview(path: str, max_items: int = 50) -> str:
+    if not HAS_H5PY:
+        return "h5py_not_installed"
+    try:
+        with h5py.File(path, "r") as f:
+            keys = list(f.keys())
+            keys = keys[:max_items]
+            return ",".join(keys) if keys else "(no_keys)"
+    except Exception as e:
+        return f"h5_open_failed: {type(e).__name__}: {e}"
+
+
 def diagnose_model_file(path: str) -> Dict[str, str]:
     info: Dict[str, str] = {}
     info["path"] = os.path.abspath(path)
@@ -156,13 +168,6 @@ def diagnose_model_file(path: str) -> Dict[str, str]:
     info["looks_like_hdf5"] = "yes" if head.startswith(HDF5_MAGIC) else "no"
     info["looks_like_git_lfs_pointer"] = "yes" if head.startswith(LFS_MAGIC) else "no"
 
-    if info["looks_like_git_lfs_pointer"] == "yes":
-        try:
-            txt = head.decode("utf-8", errors="ignore")
-            info["lfs_preview"] = "\\n".join(txt.splitlines()[:5])
-        except Exception:
-            info["lfs_preview"] = "decode_failed"
-
     info["pydub_ffmpeg"] = str(getattr(AudioSegment, "converter", "unknown"))
     info["tf_version"] = getattr(tf, "__version__", "unknown")
     try:
@@ -171,12 +176,16 @@ def diagnose_model_file(path: str) -> Dict[str, str]:
     except Exception:
         info["keras_version"] = "not_installed"
 
+    info["librosa_available"] = "yes" if HAS_LIBROSA else "no"
     info["h5py_available"] = "yes" if HAS_H5PY else "no"
+    if info["looks_like_hdf5"] == "yes":
+        info["h5_keys"] = _h5_keys_preview(path)
+
     return info
 
 
 # -------------------------
-# Transformer architecture (rebuild for weights-only load)
+# Transformer architecture
 # -------------------------
 def _transformer_encoder_block(x, num_heads, d_model, ff_dim, dropout):
     attn = tf.keras.layers.MultiHeadAttention(
@@ -222,170 +231,8 @@ def build_model_transformer_time(input_shape: Tuple[int, int, int], cfg: dict) -
 
 
 # -------------------------
-# Load helpers
+# Feature extraction (same as training)
 # -------------------------
-def _read_keras_zip_json(model_path: str) -> dict:
-    with zipfile.ZipFile(model_path, "r") as z:
-        if "config.json" in z.namelist():
-            return json.loads(z.read("config.json").decode("utf-8"))
-        for n in z.namelist():
-            if n.endswith(".json"):
-                try:
-                    return json.loads(z.read(n).decode("utf-8"))
-                except Exception:
-                    continue
-    raise ValueError("No JSON config found inside .keras archive")
-
-
-def _infer_input_shape_from_config_json(cfg_json: dict) -> Optional[Tuple[int, int, int]]:
-    root = cfg_json
-    if isinstance(root, dict) and "model_config" in root:
-        root = root["model_config"]
-
-    if isinstance(root, dict) and "config" in root and isinstance(root["config"], dict) and "layers" in root["config"]:
-        mc = root["config"]
-    elif isinstance(root, dict) and "layers" in root:
-        mc = root
-    else:
-        return None
-
-    layers = mc.get("layers", [])
-    for layer in layers:
-        if layer.get("class_name") == "InputLayer":
-            conf = layer.get("config", {})
-            batch_shape = conf.get("batch_shape") or conf.get("batch_input_shape") or conf.get("input_shape")
-            if isinstance(batch_shape, (list, tuple)) and len(batch_shape) == 4:
-                return (int(batch_shape[1]), int(batch_shape[2]), int(batch_shape[3]))
-    return None
-
-
-def _read_h5_model_config_json(h5_path: str) -> dict:
-    if not HAS_H5PY:
-        raise RuntimeError("h5py is required to parse HDF5 model_config. Add 'h5py' to requirements.txt")
-
-    with h5py.File(h5_path, "r") as f:
-        # legacy Keras H5 stores model_config in file attrs
-        mc = f.attrs.get("model_config", None)
-        if mc is None:
-            # some variants store it as bytes under different key
-            raise RuntimeError("HDF5 file has no 'model_config' attribute. Cannot infer input shape.")
-        if isinstance(mc, (bytes, bytearray)):
-            mc = mc.decode("utf-8", errors="strict")
-        return json.loads(mc)
-
-
-def _try_direct_load(model_path: str):
-    # Direct load may fail with unsupported callable; we still try for completeness.
-    custom_objects = {"TFOpLambda": tf.keras.layers.Lambda, "SlicingOpLambda": tf.keras.layers.Lambda}
-    with tf.keras.utils.custom_object_scope(custom_objects):
-        return tf.keras.models.load_model(model_path, compile=False)
-
-
-def load_model_and_cfg(model_path: str):
-    cfg = build_effective_cfg(model_path)
-
-    ft = str(cfg.get("feature_type", "raw")).lower()
-    if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
-        raise RuntimeError(f"Model requires librosa (feature_type={ft}), but librosa is not installed")
-
-    diag = diagnose_model_file(model_path)
-
-    if diag.get("looks_like_git_lfs_pointer") == "yes":
-        raise RuntimeError(
-            "Model file is a Git LFS pointer, not the actual binary weights.\n"
-            "You need to fetch LFS files when deploying (git lfs pull) or upload real binaries.\n"
-            f"Diagnostics: {diag}"
-        )
-
-    # 1) If HDF5: DO NOT deserialize model (will hit unsupported callable).
-    #    Instead: parse model_config via h5py -> infer input -> rebuild -> load_weights(h5)
-    if diag.get("looks_like_hdf5") == "yes":
-        try:
-            cfg_json = _read_h5_model_config_json(model_path)
-            in_shape = _infer_input_shape_from_config_json(cfg_json)
-            if in_shape is None:
-                raise RuntimeError("Could not infer input_shape from HDF5 model_config")
-            model = build_model_transformer_time(in_shape, cfg)
-            model.build((None,) + tuple(in_shape))
-            model.load_weights(model_path)  # <- weights from HDF5
-            return model, cfg
-        except Exception as e:
-            raise RuntimeError(
-                "Failed to load transformer model from HDF5 via weights-only path.\n"
-                f"Error: {type(e).__name__}: {e}\n"
-                f"Diagnostics: {diag}"
-            ) from e
-
-    # 2) If zip .keras: try direct, then weights-only from zip
-    if diag.get("looks_like_zip") == "yes":
-        try:
-            model = _try_direct_load(model_path)
-            return model, cfg
-        except Exception as e1:
-            try:
-                cfg_json = _read_keras_zip_json(model_path)
-                in_shape = _infer_input_shape_from_config_json(cfg_json)
-                if in_shape is None:
-                    raise RuntimeError("Could not infer input_shape from .keras config.json")
-
-                model = build_model_transformer_time(in_shape, cfg)
-                model.build((None,) + tuple(in_shape))
-
-                # Extract weights file from zip
-                tmp_root = tempfile.mkdtemp(prefix="keras_zip_")
-                try:
-                    with zipfile.ZipFile(model_path, "r") as z:
-                        cand = None
-                        for n in z.namelist():
-                            if n.endswith("model.weights.h5") or n.endswith(".weights.h5"):
-                                cand = n
-                                break
-                        if cand is None:
-                            for n in z.namelist():
-                                if n.endswith(".h5"):
-                                    cand = n
-                                    break
-                        if cand is None:
-                            raise RuntimeError("No weights .h5 found inside .keras zip")
-
-                        z.extract(cand, tmp_root)
-                        wpath = os.path.join(tmp_root, cand)
-                        model.load_weights(wpath)
-                finally:
-                    shutil.rmtree(tmp_root, ignore_errors=True)
-
-                return model, cfg
-
-            except Exception as e2:
-                raise RuntimeError(
-                    "Failed to load transformer model.\n"
-                    f"Direct load error: {type(e1).__name__}: {e1}\n"
-                    f"Weights-only zip error: {type(e2).__name__}: {e2}\n"
-                    f"Diagnostics: {diag}"
-                ) from e2
-
-    # 3) Unknown file type
-    raise RuntimeError(
-        "Failed to load transformer model: unknown file format.\n"
-        f"Diagnostics: {diag}"
-    )
-
-
-# -------------------------
-# Audio + features (same logic as training)
-# -------------------------
-def load_audio_mono_from_bytes(audio_bytes: bytes, suffix: str, sr: int) -> np.ndarray:
-    with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
-        tmp.write(audio_bytes)
-        tmp.flush()
-        seg = AudioSegment.from_file(tmp.name)
-        seg = seg.set_frame_rate(sr).set_channels(1)
-        samples = np.array(seg.get_array_of_samples())
-        sw = seg.sample_width
-        denom = {1: 128.0, 2: 32768.0, 4: 2147483648.0}.get(sw, float(2 ** (8 * sw - 1)))
-        return (samples.astype(np.float32) / denom)
-
-
 def transform_audio(audio: np.ndarray, method: Optional[str]) -> np.ndarray:
     if method is None:
         return audio.astype(np.float32, copy=False)
@@ -540,6 +387,93 @@ def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict):
         return extract_mfcc_deltas(audio, sr, cfg), int(cfg.get("stft_hop_length", 256))
 
     raise ValueError(f"Unsupported feature_type: {ftype}")
+
+
+def _infer_T_D_from_cfg(cfg: dict) -> Tuple[int, int]:
+    """
+    Reliable inference without reading H5 model_config.
+    - T inferred from zero-signal feature extraction (except raw/td_spec_stats -> formula)
+    - D inferred from extracted feature matrix
+    """
+    sr = int(cfg.get("sample_rate", 44100))
+    win_sec = float(cfg.get("noise_length_sec", 5.0))
+    win_len = int(sr * win_sec)
+    audio0 = np.zeros((win_len,), dtype=np.float32)
+
+    ft = str(cfg.get("feature_type", "raw")).lower()
+    if ft in ("raw", "td_spec_stats"):
+        frame_len = int(sr * float(cfg.get("frame_length_sec", 0.05)))
+        if frame_len <= 0:
+            raise RuntimeError("frame_length_sec invalid")
+        T = win_len // frame_len
+        X2d, _ = extract_features_from_waveform(audio0, sr, cfg)
+        D = int(X2d.shape[1]) if X2d.ndim == 2 else frame_len
+        return int(T), int(D)
+
+    # librosa features: measure actual T,D on zero signal
+    X2d, _ = extract_features_from_waveform(audio0, sr, cfg)
+    if X2d.ndim != 2 or X2d.shape[0] <= 0 or X2d.shape[1] <= 0:
+        raise RuntimeError(f"Could not infer (T,D) from feature extraction: shape={getattr(X2d,'shape',None)}")
+    return int(X2d.shape[0]), int(X2d.shape[1])
+
+
+def load_model_and_cfg(model_path: str):
+    cfg = build_effective_cfg(model_path)
+    diag = diagnose_model_file(model_path)
+
+    if diag.get("looks_like_git_lfs_pointer") == "yes":
+        raise RuntimeError(
+            "Model file is a Git LFS pointer, not actual weights.\n"
+            f"Diagnostics: {diag}"
+        )
+
+    ft = str(cfg.get("feature_type", "raw")).lower()
+    if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
+        raise RuntimeError(f"Model requires librosa (feature_type={ft}), but librosa is not installed. Diagnostics: {diag}")
+
+    # HDF5 path (your case)
+    if diag.get("looks_like_hdf5") == "yes":
+        try:
+            T, D = _infer_T_D_from_cfg(cfg)
+            in_shape = (T, D, 1)
+
+            model = build_model_transformer_time(in_shape, cfg)
+            model.build((None,) + in_shape)
+
+            # Load weights without deserializing model_config
+            model.load_weights(model_path)
+
+            return model, cfg
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to load transformer model from HDF5 via rebuild+load_weights.\n"
+                f"Error: {type(e).__name__}: {e}\n"
+                f"Diagnostics: {diag}"
+            ) from e
+
+    # Zip .keras (if you ever have it)
+    if diag.get("looks_like_zip") == "yes":
+        custom_objects = {"TFOpLambda": tf.keras.layers.Lambda, "SlicingOpLambda": tf.keras.layers.Lambda}
+        with tf.keras.utils.custom_object_scope(custom_objects):
+            model = tf.keras.models.load_model(model_path, compile=False)
+        return model, cfg
+
+    raise RuntimeError(f"Unsupported transformer model file format. Diagnostics: {diag}")
+
+
+# -------------------------
+# Inference utilities
+# -------------------------
+def load_audio_mono_from_bytes(audio_bytes: bytes, suffix: str, sr: int) -> np.ndarray:
+    with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
+        tmp.write(audio_bytes)
+        tmp.flush()
+        seg = AudioSegment.from_file(tmp.name)
+        seg = seg.set_frame_rate(sr).set_channels(1)
+        samples = np.array(seg.get_array_of_samples())
+        sw = seg.sample_width
+        denom = {1: 128.0, 2: 32768.0, 4: 2147483648.0}.get(sw, float(2 ** (8 * sw - 1)))
+        return (samples.astype(np.float32) / denom)
 
 
 def pad_or_trim_1d(x: np.ndarray, target_len: int) -> np.ndarray:
