@@ -15,14 +15,11 @@ import arch_roo
 import arch_tcn
 import arch_transformer
 
-
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-FOLDERS = {
-    "selected_models": os.path.join(APP_DIR, "selected_models"),
-    "best_models": os.path.join(APP_DIR, "best_models"),
-    "better_models": os.path.join(APP_DIR, "better_models"),
-}
+SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
+BEST_MODELS_DIR = os.path.join(APP_DIR, "best_models")
+BETTER_MODELS_DIR = os.path.join(APP_DIR, "better_models")
 
 ARCH_MODULES = {
     "basic": arch_basic,
@@ -33,84 +30,99 @@ ARCH_MODULES = {
     "transformer": arch_transformer,
 }
 
-SUPPORTED_AUDIO = ["wav", "m4a", "mp3", "flac", "ogg"]
+ALL_MODEL_DIRS = {
+    "selected_models": SELECTED_MODELS_DIR,
+    "best_models": BEST_MODELS_DIR,
+    "better_models": BETTER_MODELS_DIR,
+}
 
 
-def ensure_dirs():
-    for p in FOLDERS.values():
-        os.makedirs(p, exist_ok=True)
+# -----------------------------
+# Helpers: safe paths + scanning
+# -----------------------------
+def _ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
 
 
-def list_models_in_folder(folder_path: str) -> List[str]:
-    pattern = os.path.join(os.path.abspath(folder_path), "**", "*.keras")
+def _is_inside(base_dir: str, path: str) -> bool:
+    base = os.path.realpath(base_dir)
+    p = os.path.realpath(path)
+    try:
+        common = os.path.commonpath([base, p])
+    except Exception:
+        return False
+    return common == base
+
+
+def _rel_to_app(path: str) -> str:
+    try:
+        return os.path.relpath(path, APP_DIR)
+    except Exception:
+        return path
+
+
+def _scan_keras_in_dir(folder: str) -> List[str]:
+    if not os.path.isdir(folder):
+        return []
+    pattern = os.path.join(os.path.abspath(folder), "**", "*.keras")
     return sorted(glob.glob(pattern, recursive=True))
 
 
-def infer_arch_module(model_path: str):
-    for _arch_name, mod in ARCH_MODULES.items():
-        if mod.can_handle_model(model_path):
-            return mod
-    return None
+def _list_all_models_across_folders() -> List[str]:
+    out = []
+    for _name, d in ALL_MODEL_DIRS.items():
+        out.extend(_scan_keras_in_dir(d))
+    return sorted(set(os.path.abspath(p) for p in out))
 
 
-def model_tag_from_path(model_path: str) -> str:
-    return os.path.basename(model_path).replace(".keras", "")
-
-
-def sidecar_candidates(model_path: str) -> List[str]:
+def _find_config_for_model(model_path: str) -> Optional[str]:
+    """
+    Tries to locate config for a given model:
+      - config_<tag>.json next to model
+      - otherwise: any config_*.json next to model (fallback)
+    """
     d = os.path.dirname(os.path.abspath(model_path))
-    tag = model_tag_from_path(model_path)
-    cands = [
-        os.path.join(d, f"config_{tag}.json"),
-        os.path.join(d, f"{tag}.json"),
-    ]
-    return [p for p in cands if os.path.exists(p)]
+    tag = os.path.basename(model_path).replace(".keras", "")
+    exact = os.path.join(d, f"config_{tag}.json")
+    if os.path.exists(exact):
+        return exact
+    cands = sorted(glob.glob(os.path.join(d, "config_*.json")))
+    return cands[0] if cands else None
 
 
-def move_or_copy_model(model_path: str, dst_dir: str, op: str) -> Tuple[bool, str]:
-    if op not in ("move", "copy"):
-        return False, f"Unknown op: {op}"
+def _safe_move(src: str, dst_dir: str) -> str:
+    """
+    Moves file to dst_dir preserving basename.
+    Returns new path.
+    """
+    _ensure_dir(dst_dir)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(src)
+    if not _is_inside(APP_DIR, src):
+        raise ValueError(f"Refusing to move file outside APP_DIR: {src}")
+    if not _is_inside(APP_DIR, dst_dir):
+        raise ValueError(f"Refusing to move to dir outside APP_DIR: {dst_dir}")
 
-    src = os.path.abspath(model_path)
-    if not os.path.exists(src):
-        return False, f"Source not found: {src}"
+    dst = os.path.join(dst_dir, os.path.basename(src))
+    # avoid accidental overwrite
+    if os.path.exists(dst):
+        raise FileExistsError(f"Destination already exists: {dst}")
 
-    os.makedirs(dst_dir, exist_ok=True)
-    dst_model = os.path.join(dst_dir, os.path.basename(src))
-
-    if os.path.abspath(os.path.dirname(src)) == os.path.abspath(dst_dir):
-        return False, "Source and destination folders are the same."
-
-    if os.path.exists(dst_model):
-        return False, f"Destination already has: {dst_model}"
-
-    files = [src] + sidecar_candidates(src)
-
-    try:
-        if op == "copy":
-            for f in files:
-                shutil.copy2(f, os.path.join(dst_dir, os.path.basename(f)))
-        else:
-            for f in files:
-                shutil.move(f, os.path.join(dst_dir, os.path.basename(f)))
-        return True, f"{op.upper()} OK: {os.path.basename(src)} (+{len(files)-1} sidecar)"
-    except Exception as e:
-        return False, f"{op.upper()} failed: {type(e).__name__}: {e}"
+    shutil.move(src, dst)
+    return dst
 
 
-def delete_model_with_sidecars(model_path: str) -> Tuple[bool, str]:
-    src = os.path.abspath(model_path)
-    if not os.path.exists(src):
-        return False, f"Not found: {src}"
-
-    files = [src] + sidecar_candidates(src)
-    try:
-        for f in files:
-            if os.path.exists(f):
-                os.remove(f)
-        return True, f"DELETE OK: {os.path.basename(src)} (+{len(files)-1} sidecar)"
-    except Exception as e:
-        return False, f"DELETE failed: {type(e).__name__}: {e}"
+# -----------------------------
+# Model discovery for inference (only selected_models)
+# -----------------------------
+def list_all_models_selected_only() -> List[str]:
+    """
+    inference UI should list only selected_models (as you had).
+    """
+    out = []
+    for mod in ARCH_MODULES.values():
+        out.extend(mod.list_models(SELECTED_MODELS_DIR))
+    return sorted(set(out))
 
 
 @st.cache_data(show_spinner=False)
@@ -140,14 +152,14 @@ def plot_predictions_overlay(
 ):
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    for model_label, df in dfs_by_model.items():
+    for model_name, df in dfs_by_model.items():
         if df is None or df.empty:
             continue
         ax.plot(
             df["time_sec"].to_numpy(),
             df[y_col].to_numpy(),
-            label=model_label,
-            color=colors.get(model_label, None),
+            label=model_name,
+            color=colors.get(model_name, None),
         )
     ax.set_title(title)
     ax.set_xlabel("Time, sec")
@@ -157,129 +169,132 @@ def plot_predictions_overlay(
     st.pyplot(fig, clear_figure=True)
 
 
-st.set_page_config(page_title="Inhale inference + model manager", layout="wide")
-st.title("Inhale inference + model manager")
+# -----------------------------
+# Load model routing (by handler)
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def load_one_model(model_path: str):
+    for arch_name, mod in ARCH_MODULES.items():
+        if mod.can_handle_model(model_path):
+            model, cfg = mod.load_model_and_cfg(model_path)
+            return arch_name, model, cfg
+    raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
 
-ensure_dirs()
 
-# ---------------- Sidebar ----------------
+# -----------------------------
+# Streamlit App
+# -----------------------------
+st.set_page_config(page_title="Inhale inference", layout="wide")
+st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
+
+# ensure folders exist (safe)
+for d in ALL_MODEL_DIRS.values():
+    _ensure_dir(d)
+
 with st.sidebar:
-    st.header("Model folders")
-    st.write({k: v for k, v in FOLDERS.items()})
+    st.header("Model manager (optional)")
+    enable_manager = st.checkbox("Enable moving models between folders", value=False)
 
-    st.divider()
-    st.header("Model manager (manual)")
+    if enable_manager:
+        st.caption("Move .keras files (and matching config_*.json when found) between folders.")
+        src_folder_name = st.selectbox("Source folder", options=list(ALL_MODEL_DIRS.keys()), index=0)
+        dst_folder_name = st.selectbox("Destination folder", options=list(ALL_MODEL_DIRS.keys()), index=1)
 
-    src_folder_key = st.selectbox("Source folder", options=list(FOLDERS.keys()), index=0)
-    src_dir = FOLDERS[src_folder_key]
-    src_models = list_models_in_folder(src_dir)
+        src_dir = ALL_MODEL_DIRS[src_folder_name]
+        dst_dir = ALL_MODEL_DIRS[dst_folder_name]
 
-    selected_for_ops = st.multiselect(
-        "Select models to manage",
-        options=src_models,
-        format_func=lambda p: os.path.relpath(p, src_dir),
-    )
-
-    operation = st.radio("Operation", options=["COPY", "MOVE", "DELETE"], horizontal=True)
-
-    dst_folder_key = st.selectbox(
-        "Destination folder",
-        options=list(FOLDERS.keys()),
-        index=1,
-        disabled=(operation == "DELETE"),
-    )
-    dst_dir = FOLDERS[dst_folder_key]
-
-    confirm_delete = False
-    if operation == "DELETE":
-        confirm_delete = st.checkbox("Confirm delete (irreversible)", value=False)
-
-    execute = st.button("Execute operation", use_container_width=True)
-
-    if execute:
-        if not selected_for_ops:
-            st.warning("No models selected.")
+        src_models = _scan_keras_in_dir(src_dir)
+        if not src_models:
+            st.info(f"No .keras files in {src_folder_name}.")
         else:
-            msgs = []
-            if operation in ("COPY", "MOVE"):
-                op = operation.lower()
-                for mp in selected_for_ops:
-                    ok, msg = move_or_copy_model(mp, dst_dir, op)
-                    msgs.append(("✅" if ok else "❌") + " " + msg)
-                st.write("\n".join(msgs))
-                st.rerun()
+            to_move = st.multiselect(
+                "Select models to move",
+                options=src_models,
+                format_func=lambda p: _rel_to_app(p),
+            )
 
-            if operation == "DELETE":
-                if not confirm_delete:
-                    st.error("Enable confirmation checkbox to delete.")
-                else:
-                    for mp in selected_for_ops:
-                        ok, msg = delete_model_with_sidecars(mp)
-                        msgs.append(("✅" if ok else "❌") + " " + msg)
-                    st.write("\n".join(msgs))
-                    st.rerun()
+            move_with_config = st.checkbox("Also move matching config_*.json (if found next to model)", value=True)
+
+            if st.button("Move selected", type="primary", disabled=(len(to_move) == 0 or src_folder_name == dst_folder_name)):
+                moved = []
+                failed = []
+                for mp in to_move:
+                    try:
+                        # move model
+                        new_mp = _safe_move(mp, dst_dir)
+                        moved.append((_rel_to_app(mp), _rel_to_app(new_mp)))
+
+                        # move config (optional)
+                        if move_with_config:
+                            cfg_path = _find_config_for_model(new_mp)  # after move, config still in old dir; so also check old
+                            # better: check old dir explicitly too
+                            cfg_old = _find_config_for_model(os.path.join(src_dir, os.path.basename(new_mp)))
+                            if cfg_old and os.path.exists(cfg_old):
+                                _safe_move(cfg_old, dst_dir)
+
+                    except Exception as e:
+                        failed.append(f"{_rel_to_app(mp)}: {type(e).__name__}: {e}")
+
+                # clear caches because file set changed
+                st.cache_resource.clear()
+                st.cache_data.clear()
+
+                if moved:
+                    st.success("Moved:\n" + "\n".join([f"{a}  ->  {b}" for a, b in moved]))
+                if failed:
+                    st.error("Failed:\n" + "\n".join(failed))
 
     st.divider()
     st.header("Inference")
+    st.caption("Inference list shows ONLY selected_models/")
 
-    infer_folder_key = st.selectbox("Inference folder", options=list(FOLDERS.keys()), index=0)
-    infer_dir = FOLDERS[infer_folder_key]
+    all_models = list_all_models_selected_only()
+    if not all_models:
+        st.error(f"No models found in '{_rel_to_app(SELECTED_MODELS_DIR)}'.")
+        st.stop()
 
+    chosen = st.multiselect(
+        "Select up to 3 models",
+        options=all_models,
+        format_func=lambda p: os.path.relpath(p, SELECTED_MODELS_DIR),
+        max_selections=3,
+    )
+
+    st.header("Windowing")
     hop_sec = st.number_input(
-        "Window hop (sec). Used only if default hop is OFF",
+        "Window hop (sec). Used only if 'Use hop = noise_length_sec' is OFF",
         min_value=0.1,
         value=5.0,
         step=0.1,
     )
     use_default_hop = st.checkbox("Use hop = noise_length_sec (per model)", value=True)
 
+    st.header("Upload audio")
     uploads = st.file_uploader(
         "Upload audio files (10+ is OK)",
-        type=SUPPORTED_AUDIO,
+        type=["wav", "m4a", "mp3", "flac", "ogg"],
         accept_multiple_files=True,
     )
 
-# ---------------- Inference UI ----------------
-infer_models = list_models_in_folder(infer_dir)
-if not infer_models:
-    st.error(f"No models found in {infer_folder_key} ({infer_dir})")
-    st.stop()
-
-chosen = st.multiselect(
-    "Select up to 3 models for inference",
-    options=infer_models,
-    format_func=lambda p: os.path.relpath(p, infer_dir),
-    max_selections=3,
-)
-
 if not chosen:
-    st.info("Select 1–3 models above.")
+    st.info("Select 1–3 models in the sidebar.")
     st.stop()
-
 if not uploads:
     st.info("Upload one or more audio files in the sidebar.")
     st.stop()
 
 palette = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3", "C4"])
-chosen_names = [os.path.relpath(p, infer_dir) for p in chosen]
+chosen_names = [os.path.relpath(p, SELECTED_MODELS_DIR) for p in chosen]
 colors = {chosen_names[i]: palette[i % len(palette)] for i in range(len(chosen_names))}
 
-@st.cache_resource(show_spinner=False)
-def load_one_model(model_path: str):
-    mod = infer_arch_module(model_path)
-    if mod is None:
-        raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
-    model, cfg = mod.load_model_and_cfg(model_path)
-    return mod, model, cfg
-
-
-bundle = {}
+# load selected models
+bundle = {}  # label -> (arch_group, model, cfg)
 errors = []
 for p in chosen:
-    label = os.path.relpath(p, infer_dir)
+    label = os.path.relpath(p, SELECTED_MODELS_DIR)
     try:
-        mod, model, cfg = load_one_model(p)
-        bundle[label] = (mod, model, cfg)
+        arch_name, model, cfg = load_one_model(p)
+        bundle[label] = (arch_name, model, cfg)
     except Exception as e:
         errors.append(f"{label}: {type(e).__name__}: {e}")
 
@@ -287,19 +302,22 @@ if errors:
     st.error("Some selected models failed to load:\n\n" + "\n".join(errors))
     st.stop()
 
+# run inference for each upload
 for up in uploads:
     audio_name = up.name
     suffix = os.path.splitext(audio_name)[1].lower()
     audio_bytes = up.read()
 
     st.markdown(f"## {audio_name}")
+
     t, x = waveform_for_display(audio_bytes, suffix, sr=44100)
     plot_waveform(t, x, title=f"Waveform: {audio_name}")
 
     dfs_by_model = {}
     with st.spinner(f"Predicting for {audio_name} with {len(bundle)} model(s)..."):
-        for label, (mod, model, cfg) in bundle.items():
+        for label, (arch_name, model, cfg) in bundle.items():
             hop = None if use_default_hop else float(hop_sec)
+            mod = ARCH_MODULES[arch_name]
             df = mod.predict_audio_bytes(model=model, cfg=cfg, audio_bytes=audio_bytes, suffix=suffix, hop_sec=hop)
             dfs_by_model[label] = df
 
@@ -308,9 +326,10 @@ for up in uploads:
 
     with st.expander("Selected models details"):
         rows = []
-        for label, (_mod, _m, cfg) in bundle.items():
+        for label, (arch_name, _m, cfg) in bundle.items():
             rows.append({
                 "model": label,
+                "arch_group": arch_name,
                 "model_type": cfg.get("model_type"),
                 "feature_type": cfg.get("feature_type"),
                 "transform": cfg.get("transformation_method"),
