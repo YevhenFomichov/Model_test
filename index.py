@@ -1,6 +1,5 @@
 # index.py
 import os
-import io
 import json
 import glob
 import tempfile
@@ -216,7 +215,7 @@ def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict) -> Tup
     ftype = str(cfg.get("feature_type", "raw")).lower()
 
     if ftype == "raw":
-        frame_len = int(sr * float(cfg["frame_length_sec"]))
+        frame_len = int(sr * float(cfg.get("frame_length_sec", 0.05)))
         X = frame_audio(audio, frame_len_samples=frame_len)
         return X.astype(np.float32), frame_len
 
@@ -356,11 +355,10 @@ def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
 
     diag["is_file"] = os.path.isfile(p)
     diag["is_dir"] = os.path.isdir(p)
-    diag["size_bytes"] = None
     try:
         diag["size_bytes"] = os.path.getsize(p) if os.path.isfile(p) else None
     except Exception:
-        pass
+        diag["size_bytes"] = None
 
     if os.path.isfile(p) and is_git_lfs_pointer(p):
         return "lfs_pointer", diag
@@ -554,13 +552,26 @@ def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
             f"Model '{os.path.basename(model_path)}' requires librosa (feature_type={ft}), but librosa is not installed."
         )
 
-    # Critical fix: if it's HDF5 but named .keras -> load via temp .h5
+    def _try_load(path: str) -> tf.keras.Model:
+        # 1) standard
+        try:
+            return tf.keras.models.load_model(path, compile=False)
+        except Exception as e1:
+            # 2) fallback for transformer_time models saved with TFOpLambda nodes
+            #    Map unknown 'TFOpLambda' to a generic Lambda layer for deserialization.
+            try:
+                with tf.keras.utils.custom_object_scope({"TFOpLambda": tf.keras.layers.Lambda}):
+                    return tf.keras.models.load_model(path, compile=False)
+            except Exception:
+                raise e1
+
+    # HDF5 masquerading as .keras
     if kind == "hdf5":
         with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
             tmp_path = tmp.name
         try:
             shutil.copyfile(model_path, tmp_path)
-            model = tf.keras.models.load_model(tmp_path, compile=False)
+            model = _try_load(tmp_path)
         finally:
             try:
                 os.remove(tmp_path)
@@ -568,8 +579,7 @@ def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
                 pass
         return model, cfg
 
-    # normal cases
-    model = tf.keras.models.load_model(model_path, compile=False)
+    model = _try_load(model_path)
     return model, cfg
 
 
