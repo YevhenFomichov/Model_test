@@ -5,6 +5,7 @@ import glob
 import tempfile
 import zipfile
 import shutil
+import inspect
 from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
@@ -367,7 +368,6 @@ def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
         return "savedmodel_dir", diag
 
     if os.path.isfile(p):
-        # zip?
         try:
             diag["is_zipfile"] = zipfile.is_zipfile(p)
         except Exception:
@@ -375,12 +375,83 @@ def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
         if diag["is_zipfile"]:
             return "keras_zip", diag
 
-        # hdf5?
         diag["is_hdf5"] = is_hdf5_file(p)
         if diag["is_hdf5"]:
             return "hdf5", diag
 
     return "unknown", diag
+
+
+# =========================================================
+# TFOpLambda compatibility
+# =========================================================
+def _get_tfoplambda_class():
+    """
+    Try to locate the real TFOpLambda class in this environment.
+    If not found, return None.
+    """
+    # 1) Some TF builds export it here
+    cls = getattr(tf.keras.layers, "TFOpLambda", None)
+    if cls is not None:
+        return cls
+
+    # 2) Keras internal path (varies by version)
+    try:
+        # Keras 3 internal
+        from keras.src.layers.core.tf_op_layer import TFOpLambda as K3TFOpLambda  # type: ignore
+        return K3TFOpLambda
+    except Exception:
+        pass
+
+    try:
+        # Older keras internal
+        from keras.layers.core.tf_op_layer import TFOpLambda as K2TFOpLambda  # type: ignore
+        return K2TFOpLambda
+    except Exception:
+        pass
+
+    return None
+
+def _load_model_with_fallbacks(path: str) -> tf.keras.Model:
+    """
+    Robust model loader:
+      - tries load_model normally
+      - then tries with custom_objects + custom_object_scope for TFOpLambda
+      - if load_model supports safe_mode, sets safe_mode=False on fallback
+    """
+    tfop = _get_tfoplambda_class()
+    custom_objects = {}
+    if tfop is not None:
+        custom_objects["TFOpLambda"] = tfop
+    else:
+        # last resort: let it deserialize as a generic Lambda layer
+        custom_objects["TFOpLambda"] = tf.keras.layers.Lambda
+
+    def _call_load_model(kwargs: dict) -> tf.keras.Model:
+        # Some envs use keras.load_model signature with safe_mode; others don't.
+        sig = None
+        try:
+            sig = inspect.signature(tf.keras.models.load_model)
+        except Exception:
+            sig = None
+
+        if sig is not None and "safe_mode" in sig.parameters:
+            # allow unsafe deserialization in fallback
+            kwargs.setdefault("safe_mode", False)
+
+        return tf.keras.models.load_model(path, **kwargs)
+
+    # 1) standard attempt
+    try:
+        return _call_load_model({"compile": False})
+    except Exception as e1:
+        # 2) attempt with custom objects + scope
+        try:
+            with tf.keras.utils.custom_object_scope(custom_objects):
+                return _call_load_model({"compile": False, "custom_objects": custom_objects})
+        except Exception:
+            # raise original error to keep message stable
+            raise e1
 
 
 # =========================================================
@@ -552,26 +623,13 @@ def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
             f"Model '{os.path.basename(model_path)}' requires librosa (feature_type={ft}), but librosa is not installed."
         )
 
-    def _try_load(path: str) -> tf.keras.Model:
-        # 1) standard
-        try:
-            return tf.keras.models.load_model(path, compile=False)
-        except Exception as e1:
-            # 2) fallback for transformer_time models saved with TFOpLambda nodes
-            #    Map unknown 'TFOpLambda' to a generic Lambda layer for deserialization.
-            try:
-                with tf.keras.utils.custom_object_scope({"TFOpLambda": tf.keras.layers.Lambda}):
-                    return tf.keras.models.load_model(path, compile=False)
-            except Exception:
-                raise e1
-
-    # HDF5 masquerading as .keras
+    # HDF5 masquerading as .keras -> load via temp .h5 to trigger proper HDF5 loader
     if kind == "hdf5":
         with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
             tmp_path = tmp.name
         try:
             shutil.copyfile(model_path, tmp_path)
-            model = _try_load(tmp_path)
+            model = _load_model_with_fallbacks(tmp_path)
         finally:
             try:
                 os.remove(tmp_path)
@@ -579,7 +637,7 @@ def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
                 pass
         return model, cfg
 
-    model = _try_load(model_path)
+    model = _load_model_with_fallbacks(model_path)
     return model, cfg
 
 
@@ -618,8 +676,12 @@ def plot_predictions_overlay(
     for model_name, df in dfs_by_model.items():
         if df is None or df.empty:
             continue
-        ax.plot(df["time_sec"].to_numpy(), df[y_col].to_numpy(),
-                label=model_name, color=colors.get(model_name, None))
+        ax.plot(
+            df["time_sec"].to_numpy(),
+            df[y_col].to_numpy(),
+            label=model_name,
+            color=colors.get(model_name, None),
+        )
     ax.set_title(title)
     ax.set_xlabel("Time, sec")
     ax.set_ylabel(ylabel)
@@ -739,6 +801,7 @@ for up in uploads:
         ylabel="Dose",
         colors=colors,
     )
+
     plot_predictions_overlay(
         dfs_by_model=dfs_by_model,
         y_col="flow_smooth",
