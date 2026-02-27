@@ -16,7 +16,7 @@ import tensorflow as tf
 from pydub import AudioSegment
 import matplotlib.pyplot as plt
 
-# IMPORTANT: use standalone keras loader when available
+# Standalone Keras (preferred loader in many Streamlit environments)
 try:
     import keras  # Keras 3 / standalone
     HAS_KERAS = True
@@ -36,6 +36,7 @@ SUPPORTED_EXTENSIONS = (".wav", ".m4a", ".mp3", ".flac", ".ogg")
 WINDOW_MODELS = {"cnn2d_resnet", "crnn", "tcn_time", "transformer_time", "dual_branch_time"}
 FRAME_MODELS  = {"basic", "cnn_lstm", "tcn", "multitask", "roo_tflite"}
 
+# Absolute paths relative to THIS file
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
 
@@ -52,6 +53,7 @@ def load_audio_mono_from_path(path: str, sr: int) -> np.ndarray:
     sw = seg.sample_width
     denom = {1: 128.0, 2: 32768.0, 4: 2147483648.0}.get(sw, float(2 ** (8 * sw - 1)))
     return (samples.astype(np.float32) / denom)
+
 
 def transform_audio(audio: np.ndarray, method: Optional[str]) -> np.ndarray:
     if method is None:
@@ -77,12 +79,14 @@ def transform_audio(audio: np.ndarray, method: Optional[str]) -> np.ndarray:
 
     raise ValueError(f"Unsupported transformation: {method}")
 
+
 def frame_audio(audio: np.ndarray, frame_len_samples: int) -> np.ndarray:
     n_frames = len(audio) // frame_len_samples
     if n_frames <= 0:
         return np.zeros((0, frame_len_samples), dtype=np.float32)
     a = audio[:n_frames * frame_len_samples]
     return a.reshape(n_frames, frame_len_samples).astype(np.float32)
+
 
 def normalize_feature_matrix(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     if X.size == 0:
@@ -107,6 +111,7 @@ def extract_logmel(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     mel_db = librosa.power_to_db(mel, ref=np.max)
     return mel_db.T.astype(np.float32)
 
+
 def extract_pcen_mel(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
         raise RuntimeError("librosa required for pcen_mel features")
@@ -119,6 +124,7 @@ def extract_pcen_mel(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     pcen = librosa.pcen(mel * (2**31), sr=sr).astype(np.float32)
     return pcen.T
 
+
 def extract_spectrogram(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
         raise RuntimeError("librosa required for spectrogram features")
@@ -129,6 +135,7 @@ def extract_spectrogram(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     S = librosa.stft(y=audio, n_fft=n_fft, hop_length=hop_length, win_length=win_length)
     return np.abs(S).T.astype(np.float32)
 
+
 def extract_mfcc(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
         raise RuntimeError("librosa required for mfcc features")
@@ -137,6 +144,7 @@ def extract_mfcc(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     hop_length = int(cfg.get("stft_hop_length", 256))
     M = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=n_mfcc, n_fft=n_fft, hop_length=hop_length)
     return M.T.astype(np.float32)
+
 
 def extract_mfcc_deltas(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
@@ -152,6 +160,7 @@ def extract_mfcc_deltas(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     X = np.concatenate([M, d1, d2], axis=0)
     return X.T.astype(np.float32)
 
+
 def _zcr(frame: np.ndarray) -> float:
     if frame.size <= 1:
         return 0.0
@@ -159,13 +168,16 @@ def _zcr(frame: np.ndarray) -> float:
     s[s == 0] = 1
     return float(np.mean(s[1:] != s[:-1]))
 
+
 def _rms(frame: np.ndarray) -> float:
     return float(np.sqrt(np.mean(frame * frame) + 1e-12))
+
 
 def _crest_factor(frame: np.ndarray) -> float:
     rms = _rms(frame)
     peak = float(np.max(np.abs(frame))) if frame.size else 0.0
     return float(peak / (rms + 1e-12))
+
 
 def _teager(frame: np.ndarray) -> float:
     if frame.size < 3:
@@ -173,6 +185,7 @@ def _teager(frame: np.ndarray) -> float:
     x = frame
     tke = x[1:-1] * x[1:-1] - x[:-2] * x[2:]
     return float(np.mean(tke))
+
 
 def _spectral_stats(frame: np.ndarray, sr: int) -> Tuple[float, float, float]:
     if frame.size == 0:
@@ -200,6 +213,7 @@ def _spectral_stats(frame: np.ndarray, sr: int) -> Tuple[float, float, float]:
     rolloff = float(freqs[idx])
     return centroid, flatness, rolloff
 
+
 def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict) -> Tuple[np.ndarray, int]:
     frame_len = int(sr * float(cfg["frame_length_sec"]))
     Xf = frame_audio(audio, frame_len_samples=frame_len)
@@ -218,6 +232,7 @@ def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict) -> Tuple[np.nda
         out[i, 5] = f
         out[i, 6] = r
     return out.astype(np.float32), frame_len
+
 
 def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict) -> Tuple[np.ndarray, int]:
     ftype = str(cfg.get("feature_type", "raw")).lower()
@@ -264,6 +279,7 @@ def infer_train_unit_for_model(model_type: str) -> str:
     mt = str(model_type).lower()
     return "window" if mt in WINDOW_MODELS else "frame"
 
+
 def parse_model_filename(model_path: str) -> Dict[str, Optional[str]]:
     base = os.path.basename(model_path)
     if base.lower().endswith(".keras"):
@@ -281,6 +297,7 @@ def parse_model_filename(model_path: str) -> Dict[str, Optional[str]]:
     transform = None if transform == "None" else transform
     return {"model_type": arch, "feature_type": feat, "transformation_method": transform, "loss_type": loss}
 
+
 def find_nearby_config_json(model_path: str) -> Optional[str]:
     d = os.path.dirname(os.path.abspath(model_path))
     cands = sorted(glob.glob(os.path.join(d, "config_*.json")))
@@ -292,7 +309,9 @@ def find_nearby_config_json(model_path: str) -> Optional[str]:
         return exact
     return cands[0]
 
+
 def build_effective_cfg(model_path: str) -> dict:
+    # Conservative defaults (do not change hyperparams; only inference-relevant)
     default_cfg = {
         "sample_rate": 44100,
         "frame_length_sec": 0.05,
@@ -333,7 +352,7 @@ def build_effective_cfg(model_path: str) -> dict:
 
 
 # =========================================================
-# Artifact type detection (zip / dir / hdf5 / lfs)
+# Artifact type detection
 # =========================================================
 def is_git_lfs_pointer(path: str) -> bool:
     try:
@@ -343,6 +362,7 @@ def is_git_lfs_pointer(path: str) -> bool:
     except Exception:
         return False
 
+
 def is_hdf5_file(path: str) -> bool:
     try:
         with open(path, "rb") as f:
@@ -350,6 +370,7 @@ def is_hdf5_file(path: str) -> bool:
         return head == HDF5_MAGIC
     except Exception:
         return False
+
 
 def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
     """
@@ -390,10 +411,20 @@ def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
 
 
 # =========================================================
-# Robust loader for TFOpLambda across Keras/TF variants
+# Robust loader for TFOpLambda / callable deserialization
 # =========================================================
+def _enable_unsafe_deser_if_available():
+    if not HAS_KERAS:
+        return
+    try:
+        if hasattr(keras, "config") and hasattr(keras.config, "enable_unsafe_deserialization"):
+            keras.config.enable_unsafe_deserialization()
+    except Exception:
+        pass
+
+
 def _get_tfoplambda_class():
-    # Try standalone keras locations first (since error clearly comes from keras deserializer)
+    # Prefer standalone keras locations
     if HAS_KERAS:
         cls = getattr(keras.layers, "TFOpLambda", None)
         if cls is not None:
@@ -409,58 +440,52 @@ def _get_tfoplambda_class():
         except Exception:
             pass
 
-    # Then try tf.keras
+    # Then tf.keras
     cls = getattr(tf.keras.layers, "TFOpLambda", None)
     if cls is not None:
         return cls
 
     return None
 
-def _call_load_model(load_fn, path: str, *, compile_: bool, custom_objects: dict):
-    kwargs = {"compile": compile_, "custom_objects": custom_objects}
-    try:
-        sig = inspect.signature(load_fn)
-        if "safe_mode" in sig.parameters:
-            kwargs["safe_mode"] = False
-    except Exception:
-        pass
-    return load_fn(path, **kwargs)
 
 def _load_model_with_tfoplambda_fallbacks(path: str):
     tfop = _get_tfoplambda_class()
 
-    # Use Lambda as last resort mapping (only for deserialization; inference only)
+    # Map TFOpLambda to real class if exists, else to Lambda (last resort)
     if HAS_KERAS:
         lambda_layer = keras.layers.Lambda
         scope_ctx = keras.utils.custom_object_scope
-        load_fn = keras.models.load_model
     else:
         lambda_layer = tf.keras.layers.Lambda
         scope_ctx = tf.keras.utils.custom_object_scope
-        load_fn = tf.keras.models.load_model
 
     custom_objects = {"TFOpLambda": (tfop if tfop is not None else lambda_layer)}
 
-    # 1) Try standalone keras loader (preferred)
+    # 1) Preferred: standalone keras saving loader with safe_mode=False
     if HAS_KERAS:
-        try:
-            with keras.utils.custom_object_scope(custom_objects):
-                return _call_load_model(keras.models.load_model, path, compile_=False, custom_objects=custom_objects)
-        except Exception:
-            pass
+        _enable_unsafe_deser_if_available()
 
-    # 2) Try tf.keras loader
-    try:
-        with tf.keras.utils.custom_object_scope(custom_objects):
-            return _call_load_model(tf.keras.models.load_model, path, compile_=False, custom_objects=custom_objects)
-    except Exception as e2:
-        # 3) Final attempt: if standalone keras exists but failed above due to scope mismatch, try without scope
-        if HAS_KERAS:
-            try:
-                return _call_load_model(keras.models.load_model, path, compile_=False, custom_objects=custom_objects)
-            except Exception:
-                pass
-        raise e2
+        load_fn = None
+        try:
+            load_fn = keras.saving.load_model  # type: ignore[attr-defined]
+        except Exception:
+            load_fn = None
+        if load_fn is None:
+            load_fn = keras.models.load_model
+
+        try:
+            with scope_ctx(custom_objects):
+                return load_fn(path, compile=False, custom_objects=custom_objects, safe_mode=False)
+        except TypeError:
+            # safe_mode not supported
+            with scope_ctx(custom_objects):
+                return load_fn(path, compile=False, custom_objects=custom_objects)
+        except Exception:
+            pass  # continue to tf.keras fallback
+
+    # 2) Fallback: tf.keras loader with custom_objects
+    with tf.keras.utils.custom_object_scope(custom_objects):
+        return tf.keras.models.load_model(path, compile=False, custom_objects=custom_objects)
 
 
 # =========================================================
@@ -473,6 +498,7 @@ def pad_or_trim_1d(x: np.ndarray, target_len: int) -> np.ndarray:
         return x[:target_len].astype(np.float32, copy=False)
     pad = np.zeros((target_len - len(x),), dtype=np.float32)
     return np.concatenate([x.astype(np.float32, copy=False), pad], axis=0)
+
 
 def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tuple[np.ndarray, Dict[str, Any]]:
     sr = int(cfg["sample_rate"])
@@ -505,6 +531,7 @@ def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tupl
     }
     return X, info
 
+
 def model_predict_frames(model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
     train_unit = str(cfg.get("train_unit", "frame")).lower()
 
@@ -528,10 +555,12 @@ def model_predict_frames(model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
 
     raise ValueError(f"Unsupported train_unit: {train_unit}")
 
+
 def rolling_mean_5(x: np.ndarray) -> np.ndarray:
     if x.size == 0:
         return x
     return pd.Series(x).rolling(window=5, min_periods=1, center=True).mean().to_numpy(dtype=np.float32)
+
 
 def predict_audio_bytes_for_model(
     model,
@@ -588,7 +617,7 @@ def predict_audio_bytes_for_model(
 
 
 # =========================================================
-# Model discovery + filtering
+# Model discovery
 # =========================================================
 def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str, str, Dict[str, Any]]]]:
     pattern = os.path.join(os.path.abspath(selected_models_dir), "**", "*.keras")
@@ -607,7 +636,7 @@ def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str
 
 
 # =========================================================
-# Streamlit caching
+# Streamlit caching: robust model loader + cfg
 # =========================================================
 @st.cache_resource(show_spinner=False)
 def load_model_and_cfg(model_path: str):
@@ -626,13 +655,14 @@ def load_model_and_cfg(model_path: str):
         )
 
     cfg = build_effective_cfg(model_path)
+
     ft = str(cfg.get("feature_type", "raw")).lower()
     if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(
             f"Model '{os.path.basename(model_path)}' requires librosa (feature_type={ft}), but librosa is not installed."
         )
 
-    # HDF5 masquerading as .keras -> load via temp .h5 (forces correct backend path)
+    # HDF5 masquerading as .keras -> load via temp .h5 (forces proper backend)
     if kind == "hdf5":
         with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
             tmp_path = tmp.name
@@ -673,6 +703,7 @@ def plot_waveform(t: np.ndarray, x: np.ndarray, title: str):
     ax.grid(True, alpha=0.3)
     st.pyplot(fig, clear_figure=True)
 
+
 def plot_predictions_overlay(
     dfs_by_model: Dict[str, pd.DataFrame],
     y_col: str,
@@ -685,8 +716,12 @@ def plot_predictions_overlay(
     for model_name, df in dfs_by_model.items():
         if df is None or df.empty:
             continue
-        ax.plot(df["time_sec"].to_numpy(), df[y_col].to_numpy(),
-                label=model_name, color=colors.get(model_name, None))
+        ax.plot(
+            df["time_sec"].to_numpy(),
+            df[y_col].to_numpy(),
+            label=model_name,
+            color=colors.get(model_name, None),
+        )
     ax.set_title(title)
     ax.set_xlabel("Time, sec")
     ax.set_ylabel(ylabel)
