@@ -17,6 +17,12 @@ try:
 except ImportError:
     HAS_LIBROSA = False
 
+try:
+    import h5py
+    HAS_H5PY = True
+except ImportError:
+    HAS_H5PY = False
+
 
 ARCH_GROUP = "transformer"
 MODEL_TYPES = {"transformer_time"}
@@ -124,7 +130,7 @@ def build_effective_cfg(model_path: str) -> dict:
 
 
 # -------------------------
-# Diagnostics (temporary but useful)
+# Diagnostics
 # -------------------------
 def _read_head(path: str, n: int = 256) -> bytes:
     try:
@@ -151,17 +157,13 @@ def diagnose_model_file(path: str) -> Dict[str, str]:
     info["looks_like_git_lfs_pointer"] = "yes" if head.startswith(LFS_MAGIC) else "no"
 
     if info["looks_like_git_lfs_pointer"] == "yes":
-        # show first few lines
         try:
             txt = head.decode("utf-8", errors="ignore")
             info["lfs_preview"] = "\\n".join(txt.splitlines()[:5])
         except Exception:
             info["lfs_preview"] = "decode_failed"
 
-    # pydub/ffmpeg diag
     info["pydub_ffmpeg"] = str(getattr(AudioSegment, "converter", "unknown"))
-
-    # TF/Keras diag
     info["tf_version"] = getattr(tf, "__version__", "unknown")
     try:
         import keras  # noqa
@@ -169,6 +171,7 @@ def diagnose_model_file(path: str) -> Dict[str, str]:
     except Exception:
         info["keras_version"] = "not_installed"
 
+    info["h5py_available"] = "yes" if HAS_H5PY else "no"
     return info
 
 
@@ -221,38 +224,10 @@ def build_model_transformer_time(input_shape: Tuple[int, int, int], cfg: dict) -
 # -------------------------
 # Load helpers
 # -------------------------
-def _try_load_direct_any_format(model_path: str):
-    """
-    1) If file is HDF5 (even with .keras ext) -> load as H5
-    2) Else attempt tf.keras load_model (zip .keras)
-    """
-    head = _read_head(model_path, 16)
-    custom_objects = {"TFOpLambda": tf.keras.layers.Lambda, "SlicingOpLambda": tf.keras.layers.Lambda}
-
-    # HDF5 disguised as .keras
-    if head.startswith(HDF5_MAGIC):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
-            tmp_path = tmp.name
-        try:
-            shutil.copyfile(model_path, tmp_path)
-            with tf.keras.utils.custom_object_scope(custom_objects):
-                return tf.keras.models.load_model(tmp_path, compile=False)
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
-
-    # normal .keras zip
-    with tf.keras.utils.custom_object_scope(custom_objects):
-        return tf.keras.models.load_model(model_path, compile=False)
-
-
 def _read_keras_zip_json(model_path: str) -> dict:
     with zipfile.ZipFile(model_path, "r") as z:
         if "config.json" in z.namelist():
             return json.loads(z.read("config.json").decode("utf-8"))
-        # fallback: first json
         for n in z.namelist():
             if n.endswith(".json"):
                 try:
@@ -267,8 +242,6 @@ def _infer_input_shape_from_config_json(cfg_json: dict) -> Optional[Tuple[int, i
     if isinstance(root, dict) and "model_config" in root:
         root = root["model_config"]
 
-    # common shapes:
-    # {"config": {"layers": [...]}}
     if isinstance(root, dict) and "config" in root and isinstance(root["config"], dict) and "layers" in root["config"]:
         mc = root["config"]
     elif isinstance(root, dict) and "layers" in root:
@@ -286,88 +259,116 @@ def _infer_input_shape_from_config_json(cfg_json: dict) -> Optional[Tuple[int, i
     return None
 
 
-def _extract_weights_from_zip(model_path: str) -> Tuple[str, str]:
-    """
-    returns (weights_path, tmp_root_dir)
-    """
-    tmp_root = tempfile.mkdtemp(prefix="keras_zip_")
-    with zipfile.ZipFile(model_path, "r") as z:
-        # Prefer Keras3 weights file
-        cand = None
-        for n in z.namelist():
-            if n.endswith("model.weights.h5") or n.endswith(".weights.h5"):
-                cand = n
-                break
-        if cand is None:
-            for n in z.namelist():
-                if n.endswith(".h5"):
-                    cand = n
-                    break
-        if cand is None:
-            shutil.rmtree(tmp_root, ignore_errors=True)
-            raise ValueError("No weights .h5 found inside .keras zip")
-        z.extract(cand, tmp_root)
-        return os.path.join(tmp_root, cand), tmp_root
+def _read_h5_model_config_json(h5_path: str) -> dict:
+    if not HAS_H5PY:
+        raise RuntimeError("h5py is required to parse HDF5 model_config. Add 'h5py' to requirements.txt")
+
+    with h5py.File(h5_path, "r") as f:
+        # legacy Keras H5 stores model_config in file attrs
+        mc = f.attrs.get("model_config", None)
+        if mc is None:
+            # some variants store it as bytes under different key
+            raise RuntimeError("HDF5 file has no 'model_config' attribute. Cannot infer input shape.")
+        if isinstance(mc, (bytes, bytearray)):
+            mc = mc.decode("utf-8", errors="strict")
+        return json.loads(mc)
+
+
+def _try_direct_load(model_path: str):
+    # Direct load may fail with unsupported callable; we still try for completeness.
+    custom_objects = {"TFOpLambda": tf.keras.layers.Lambda, "SlicingOpLambda": tf.keras.layers.Lambda}
+    with tf.keras.utils.custom_object_scope(custom_objects):
+        return tf.keras.models.load_model(model_path, compile=False)
 
 
 def load_model_and_cfg(model_path: str):
     cfg = build_effective_cfg(model_path)
 
-    # feature availability
     ft = str(cfg.get("feature_type", "raw")).lower()
     if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(f"Model requires librosa (feature_type={ft}), but librosa is not installed")
 
     diag = diagnose_model_file(model_path)
 
-    # If git-lfs pointer -> fail with clear message
     if diag.get("looks_like_git_lfs_pointer") == "yes":
         raise RuntimeError(
             "Model file is a Git LFS pointer, not the actual binary weights.\n"
-            "You need to fetch LFS files when deploying (git lfs pull) "
-            "or upload real binaries to the repo.\n"
+            "You need to fetch LFS files when deploying (git lfs pull) or upload real binaries.\n"
             f"Diagnostics: {diag}"
         )
 
-    # 1) Try direct load (supports zip .keras or HDF5 disguised)
-    try:
-        model = _try_load_direct_any_format(model_path)
-        return model, cfg
-    except Exception as e1:
-        # 2) weights-only load ONLY if it's a real zip .keras
-        if not zipfile.is_zipfile(model_path):
-            raise RuntimeError(
-                "Failed to load transformer model.\n"
-                f"Direct load error: {type(e1).__name__}: {e1}\n"
-                "Weights-only load skipped because file is not a valid .keras zip.\n"
-                f"Diagnostics: {diag}"
-            ) from e1
-
-        # weights-only path
+    # 1) If HDF5: DO NOT deserialize model (will hit unsupported callable).
+    #    Instead: parse model_config via h5py -> infer input -> rebuild -> load_weights(h5)
+    if diag.get("looks_like_hdf5") == "yes":
         try:
-            cfg_json = _read_keras_zip_json(model_path)
+            cfg_json = _read_h5_model_config_json(model_path)
             in_shape = _infer_input_shape_from_config_json(cfg_json)
             if in_shape is None:
-                raise RuntimeError("Could not infer input_shape from .keras config.json")
-
+                raise RuntimeError("Could not infer input_shape from HDF5 model_config")
             model = build_model_transformer_time(in_shape, cfg)
             model.build((None,) + tuple(in_shape))
-
-            wpath, tmp_root = _extract_weights_from_zip(model_path)
-            try:
-                model.load_weights(wpath)
-            finally:
-                shutil.rmtree(tmp_root, ignore_errors=True)
-
+            model.load_weights(model_path)  # <- weights from HDF5
             return model, cfg
-
-        except Exception as e2:
+        except Exception as e:
             raise RuntimeError(
-                "Failed to load transformer model.\n"
-                f"Direct load error: {type(e1).__name__}: {e1}\n"
-                f"Weights-only load error: {type(e2).__name__}: {e2}\n"
+                "Failed to load transformer model from HDF5 via weights-only path.\n"
+                f"Error: {type(e).__name__}: {e}\n"
                 f"Diagnostics: {diag}"
-            ) from e2
+            ) from e
+
+    # 2) If zip .keras: try direct, then weights-only from zip
+    if diag.get("looks_like_zip") == "yes":
+        try:
+            model = _try_direct_load(model_path)
+            return model, cfg
+        except Exception as e1:
+            try:
+                cfg_json = _read_keras_zip_json(model_path)
+                in_shape = _infer_input_shape_from_config_json(cfg_json)
+                if in_shape is None:
+                    raise RuntimeError("Could not infer input_shape from .keras config.json")
+
+                model = build_model_transformer_time(in_shape, cfg)
+                model.build((None,) + tuple(in_shape))
+
+                # Extract weights file from zip
+                tmp_root = tempfile.mkdtemp(prefix="keras_zip_")
+                try:
+                    with zipfile.ZipFile(model_path, "r") as z:
+                        cand = None
+                        for n in z.namelist():
+                            if n.endswith("model.weights.h5") or n.endswith(".weights.h5"):
+                                cand = n
+                                break
+                        if cand is None:
+                            for n in z.namelist():
+                                if n.endswith(".h5"):
+                                    cand = n
+                                    break
+                        if cand is None:
+                            raise RuntimeError("No weights .h5 found inside .keras zip")
+
+                        z.extract(cand, tmp_root)
+                        wpath = os.path.join(tmp_root, cand)
+                        model.load_weights(wpath)
+                finally:
+                    shutil.rmtree(tmp_root, ignore_errors=True)
+
+                return model, cfg
+
+            except Exception as e2:
+                raise RuntimeError(
+                    "Failed to load transformer model.\n"
+                    f"Direct load error: {type(e1).__name__}: {e1}\n"
+                    f"Weights-only zip error: {type(e2).__name__}: {e2}\n"
+                    f"Diagnostics: {diag}"
+                ) from e2
+
+    # 3) Unknown file type
+    raise RuntimeError(
+        "Failed to load transformer model: unknown file format.\n"
+        f"Diagnostics: {diag}"
+    )
 
 
 # -------------------------
