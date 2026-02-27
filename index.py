@@ -5,6 +5,7 @@ import json
 import glob
 import tempfile
 import zipfile
+import shutil
 from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
@@ -30,6 +31,8 @@ FRAME_MODELS  = {"basic", "cnn_lstm", "tcn", "multitask", "roo_tflite"}
 # Absolute paths relative to THIS file
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
+
+HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 
 
 # =========================================================
@@ -323,21 +326,27 @@ def build_effective_cfg(model_path: str) -> dict:
 
 
 # =========================================================
-# Keras artifact validation / diagnostics
+# Artifact type detection (zip / dir / hdf5 / lfs)
 # =========================================================
 def is_git_lfs_pointer(path: str) -> bool:
     try:
         with open(path, "rb") as f:
             head = f.read(300)
-        # LFS pointer typically contains these lines
         return (b"git-lfs" in head) or (b"version https://git-lfs.github.com/spec" in head) or (b"oid sha256:" in head)
+    except Exception:
+        return False
+
+def is_hdf5_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(len(HDF5_MAGIC))
+        return head == HDF5_MAGIC
     except Exception:
         return False
 
 def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
     """
-    Returns kind in: 'keras_zip', 'savedmodel_dir', 'missing', 'lfs_pointer', 'unknown'
-    plus diagnostics dict.
+    kind in: keras_zip | savedmodel_dir | hdf5 | missing | lfs_pointer | unknown
     """
     p = os.path.abspath(path)
     diag: Dict[str, Any] = {"path": p}
@@ -347,21 +356,20 @@ def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
 
     diag["is_file"] = os.path.isfile(p)
     diag["is_dir"] = os.path.isdir(p)
-
+    diag["size_bytes"] = None
     try:
         diag["size_bytes"] = os.path.getsize(p) if os.path.isfile(p) else None
     except Exception:
-        diag["size_bytes"] = None
+        pass
 
     if os.path.isfile(p) and is_git_lfs_pointer(p):
         return "lfs_pointer", diag
 
     if os.path.isdir(p):
-        # If someone saved SavedModel into a directory (maybe with .keras suffix)
         return "savedmodel_dir", diag
 
     if os.path.isfile(p):
-        # Keras v3 .keras is a zip file
+        # zip?
         try:
             diag["is_zipfile"] = zipfile.is_zipfile(p)
         except Exception:
@@ -369,11 +377,16 @@ def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
         if diag["is_zipfile"]:
             return "keras_zip", diag
 
+        # hdf5?
+        diag["is_hdf5"] = is_hdf5_file(p)
+        if diag["is_hdf5"]:
+            return "hdf5", diag
+
     return "unknown", diag
 
 
 # =========================================================
-# Inference pipeline
+# Inference
 # =========================================================
 def pad_or_trim_1d(x: np.ndarray, target_len: int) -> np.ndarray:
     if len(x) == target_len:
@@ -497,14 +510,9 @@ def predict_audio_bytes_for_model(
 
 
 # =========================================================
-# Model discovery (FILTER invalid .keras)
+# Model discovery + filtering
 # =========================================================
 def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str, str, Dict[str, Any]]]]:
-    """
-    Returns:
-      valid_paths: list of models that look loadable (keras_zip or savedmodel_dir)
-      skipped: list of (path, kind, diag)
-    """
     pattern = os.path.join(os.path.abspath(selected_models_dir), "**", "*.keras")
     paths = sorted(glob.glob(pattern, recursive=True))
     paths = [os.path.abspath(p) for p in paths]
@@ -513,11 +521,10 @@ def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str
     skipped = []
     for p in paths:
         kind, diag = keras_artifact_kind(p)
-        if kind in ("keras_zip", "savedmodel_dir"):
+        if kind in ("keras_zip", "savedmodel_dir", "hdf5"):
             valid.append(p)
         else:
             skipped.append((p, kind, diag))
-
     return valid, skipped
 
 
@@ -527,20 +534,17 @@ def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str
 @st.cache_resource(show_spinner=False)
 def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
     model_path = os.path.abspath(model_path)
-
     kind, diag = keras_artifact_kind(model_path)
+
     if kind == "missing":
         raise FileNotFoundError(f"Model path missing: {model_path}")
     if kind == "lfs_pointer":
         raise RuntimeError(
-            f"'{os.path.basename(model_path)}' is a Git LFS pointer, not the real model file. "
-            f"Fetch LFS objects in the runtime (or commit real artifacts). "
-            f"diag={diag}"
+            f"'{os.path.basename(model_path)}' is a Git LFS pointer, not the real model file. diag={diag}"
         )
-    if kind not in ("keras_zip", "savedmodel_dir"):
+    if kind == "unknown":
         raise RuntimeError(
-            f"'{os.path.basename(model_path)}' is not a valid Keras .keras zip (or SavedModel directory). "
-            f"kind={kind}, diag={diag}"
+            f"'{os.path.basename(model_path)}' is not a recognized Keras artifact (zip/dir/hdf5). diag={diag}"
         )
 
     cfg = build_effective_cfg(model_path)
@@ -550,8 +554,24 @@ def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
             f"Model '{os.path.basename(model_path)}' requires librosa (feature_type={ft}), but librosa is not installed."
         )
 
+    # Critical fix: if it's HDF5 but named .keras -> load via temp .h5
+    if kind == "hdf5":
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
+            tmp_path = tmp.name
+        try:
+            shutil.copyfile(model_path, tmp_path)
+            model = tf.keras.models.load_model(tmp_path, compile=False)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return model, cfg
+
+    # normal cases
     model = tf.keras.models.load_model(model_path, compile=False)
     return model, cfg
+
 
 @st.cache_data(show_spinner=False)
 def waveform_for_display(audio_bytes: bytes, suffix: str, display_sr: int = 44100) -> Tuple[np.ndarray, np.ndarray]:
@@ -588,12 +608,8 @@ def plot_predictions_overlay(
     for model_name, df in dfs_by_model.items():
         if df is None or df.empty:
             continue
-        ax.plot(
-            df["time_sec"].to_numpy(),
-            df[y_col].to_numpy(),
-            label=model_name,
-            color=colors.get(model_name, None),
-        )
+        ax.plot(df["time_sec"].to_numpy(), df[y_col].to_numpy(),
+                label=model_name, color=colors.get(model_name, None))
     ax.set_title(title)
     ax.set_xlabel("Time, sec")
     ax.set_ylabel(ylabel)
@@ -611,7 +627,7 @@ st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 valid_model_paths, skipped_models = discover_models(SELECTED_MODELS_DIR)
 
 if not valid_model_paths:
-    st.error(f"No valid .keras models found in '{SELECTED_MODELS_DIR}'.")
+    st.error(f"No valid model artifacts found in '{SELECTED_MODELS_DIR}'.")
     if skipped_models:
         st.code("\n".join([f"{p} -> {kind}" for (p, kind, _d) in skipped_models[:50]]))
     st.stop()
@@ -621,7 +637,7 @@ model_labels = {p: os.path.relpath(p, SELECTED_MODELS_DIR) for p in valid_model_
 with st.sidebar:
     st.header("Models")
     chosen = st.multiselect(
-        "Select up to 3 models (only valid artifacts are listed)",
+        "Select up to 3 models",
         options=valid_model_paths,
         format_func=lambda p: model_labels.get(p, os.path.basename(p)),
         default=[],
@@ -645,15 +661,15 @@ with st.sidebar:
     )
 
     st.divider()
-    if st.checkbox("Debug paths / skipped models", value=False):
+    if st.checkbox("Debug model scan", value=False):
         st.write("APP_DIR:", APP_DIR)
         st.write("SELECTED_MODELS_DIR:", SELECTED_MODELS_DIR)
         st.write("Valid models:", len(valid_model_paths))
-        st.write(valid_model_paths[:20])
+        st.write(valid_model_paths[:10])
         st.write("Skipped models:", len(skipped_models))
         if skipped_models:
             preview = []
-            for p, kind, diag in skipped_models[:30]:
+            for p, kind, diag in skipped_models[:20]:
                 preview.append(f"{os.path.relpath(p, SELECTED_MODELS_DIR)} -> {kind} | {diag}")
             st.code("\n".join(preview))
 
@@ -665,12 +681,10 @@ if not uploads:
     st.info("Upload one or more audio files in the sidebar.")
     st.stop()
 
-# Colors: matplotlib default cycle
 palette = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3", "C4"])
 chosen_names = [model_labels[p] for p in chosen]
 colors = {chosen_names[i]: palette[i % len(palette)] for i in range(len(chosen_names))}
 
-# Load models
 models_cfgs = {}
 load_errors = []
 for p in chosen:
@@ -685,7 +699,6 @@ if load_errors:
     st.error("Some selected models failed to load:\n\n" + "\n".join(load_errors))
     st.stop()
 
-# Process each uploaded audio file
 for up in uploads:
     audio_name = up.name
     suffix = os.path.splitext(audio_name)[1].lower()
@@ -693,13 +706,10 @@ for up in uploads:
 
     st.markdown(f"## {audio_name}")
 
-    # Waveform
     t, x = waveform_for_display(audio_bytes, suffix, display_sr=44100)
     plot_waveform(t, x, title=f"Waveform: {audio_name}")
 
-    # Predictions
     dfs_by_model: Dict[str, pd.DataFrame] = {}
-
     with st.spinner(f"Predicting for {audio_name} with {len(models_cfgs)} model(s)..."):
         for model_name, (model, cfg, _model_path) in models_cfgs.items():
             window_hop_sec = None if use_default_hop else float(hop_sec)
@@ -719,7 +729,6 @@ for up in uploads:
         ylabel="Dose",
         colors=colors,
     )
-
     plot_predictions_overlay(
         dfs_by_model=dfs_by_model,
         y_col="flow_smooth",
