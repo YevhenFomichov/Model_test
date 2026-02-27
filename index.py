@@ -1,12 +1,11 @@
 import os
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-import core
 import arch_basic
 import arch_cnn
 import arch_dual
@@ -17,7 +16,7 @@ import arch_transformer
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
 
-ARCH_TO_MODULE = {
+ARCH_MODULES = {
     "basic": arch_basic,
     "cnn": arch_cnn,
     "dual": arch_dual,
@@ -26,20 +25,19 @@ ARCH_TO_MODULE = {
     "transformer": arch_transformer,
 }
 
-@st.cache_resource(show_spinner=False)
-def load_model_cfg_and_arch(model_path: str):
-    cfg = core.build_effective_cfg(model_path)
-    arch = core.infer_arch_group(cfg.get("model_type", ""))
-    ft = str(cfg.get("feature_type", "raw")).lower()
-    if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not core.HAS_LIBROSA:
-        raise RuntimeError(f"Model requires librosa (feature_type={ft}), but librosa is not installed")
-    model = core.load_keras_model_any(model_path)
-    return model, cfg, arch
+def list_all_models() -> List[str]:
+    out = []
+    for mod in ARCH_MODULES.values():
+        out.extend(mod.list_models(SELECTED_MODELS_DIR))
+    # unique + sorted
+    out = sorted(set(out))
+    return out
 
 @st.cache_data(show_spinner=False)
-def waveform_for_display(audio_bytes: bytes, suffix: str, display_sr: int = 44100):
-    x = core.load_audio_mono_from_bytes(audio_bytes, suffix, display_sr)
-    t = np.arange(len(x), dtype=np.float32) / float(display_sr)
+def waveform_for_display(audio_bytes: bytes, suffix: str, sr: int = 44100):
+    # use any module loader (they are identical); pick basic
+    x = arch_basic.load_audio_mono_from_bytes(audio_bytes, suffix, sr)
+    t = np.arange(len(x), dtype=np.float32) / float(sr)
     return t, x
 
 def plot_waveform(t: np.ndarray, x: np.ndarray, title: str):
@@ -69,21 +67,17 @@ def plot_predictions_overlay(dfs_by_model: Dict[str, pd.DataFrame], y_col: str, 
 st.set_page_config(page_title="Inhale inference", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
-valid_models, skipped = core.discover_models(SELECTED_MODELS_DIR)
-if not valid_models:
-    st.error(f"No loadable models found in '{SELECTED_MODELS_DIR}'.")
-    if skipped:
-        st.code("\n".join([f"{p} -> {kind}" for (p, kind, _d) in skipped[:50]]))
+all_models = list_all_models()
+if not all_models:
+    st.error(f"No models found in '{SELECTED_MODELS_DIR}'.")
     st.stop()
-
-model_labels = {p: os.path.relpath(p, SELECTED_MODELS_DIR) for p in valid_models}
 
 with st.sidebar:
     st.header("Models")
     chosen = st.multiselect(
         "Select up to 3 models",
-        options=valid_models,
-        format_func=lambda p: model_labels.get(p, os.path.basename(p)),
+        options=all_models,
+        format_func=lambda p: os.path.relpath(p, SELECTED_MODELS_DIR),
         max_selections=3,
     )
 
@@ -99,17 +93,9 @@ with st.sidebar:
     st.header("Upload audio")
     uploads = st.file_uploader(
         "Upload audio files (10+ is OK)",
-        type=[e.replace(".", "") for e in core.SUPPORTED_AUDIO_EXTENSIONS],
+        type=["wav", "m4a", "mp3", "flac", "ogg"],
         accept_multiple_files=True,
     )
-
-    st.divider()
-    if st.checkbox("Debug model scan", value=False):
-        st.write("SELECTED_MODELS_DIR:", SELECTED_MODELS_DIR)
-        st.write("Valid:", len(valid_models))
-        st.write("Skipped:", len(skipped))
-        if skipped:
-            st.code("\n".join([f"{os.path.relpath(p, SELECTED_MODELS_DIR)} -> {kind} | {diag}" for (p, kind, diag) in skipped[:25]]))
 
 if not chosen:
     st.info("Select 1–3 models in the sidebar.")
@@ -119,25 +105,36 @@ if not uploads:
     st.stop()
 
 palette = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3", "C4"])
-chosen_names = [model_labels[p] for p in chosen]
+chosen_names = [os.path.relpath(p, SELECTED_MODELS_DIR) for p in chosen]
 colors = {chosen_names[i]: palette[i % len(palette)] for i in range(len(chosen_names))}
 
-# load selected models
-bundle = {}  # model_label -> (model, cfg, arch)
+# load models
+bundle = {}  # label -> (arch_group, model, cfg)
 errors = []
+
+@st.cache_resource(show_spinner=False)
+def load_one_model(model_path: str):
+    # infer arch group from filename (shared logic replicated in modules)
+    # we can ask each module "can you handle this?"
+    for arch_name, mod in ARCH_MODULES.items():
+        if mod.can_handle_model(model_path):
+            model, cfg = mod.load_model_and_cfg(model_path)
+            return arch_name, model, cfg
+    raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
+
 for p in chosen:
-    name = model_labels[p]
+    label = os.path.relpath(p, SELECTED_MODELS_DIR)
     try:
-        model, cfg, arch = load_model_cfg_and_arch(p)
-        bundle[name] = (model, cfg, arch)
+        arch_name, model, cfg = load_one_model(p)
+        bundle[label] = (arch_name, model, cfg)
     except Exception as e:
-        errors.append(f"{name}: {type(e).__name__}: {e}")
+        errors.append(f"{label}: {type(e).__name__}: {e}")
 
 if errors:
     st.error("Some selected models failed to load:\n\n" + "\n".join(errors))
     st.stop()
 
-# inference for each audio
+# run inference
 for up in uploads:
     audio_name = up.name
     suffix = os.path.splitext(audio_name)[1].lower()
@@ -145,29 +142,30 @@ for up in uploads:
 
     st.markdown(f"## {audio_name}")
 
-    t, x = waveform_for_display(audio_bytes, suffix, display_sr=44100)
+    t, x = waveform_for_display(audio_bytes, suffix, sr=44100)
     plot_waveform(t, x, title=f"Waveform: {audio_name}")
 
     dfs_by_model = {}
     with st.spinner(f"Predicting for {audio_name} with {len(bundle)} model(s)..."):
-        for model_label, (model, cfg, arch) in bundle.items():
+        for label, (arch_name, model, cfg) in bundle.items():
             hop = None if use_default_hop else float(hop_sec)
-            handler = ARCH_TO_MODULE[arch]
-            df = handler.predict_audio_bytes(model=model, cfg=cfg, audio_bytes=audio_bytes, suffix=suffix, hop_sec=hop)
-            dfs_by_model[model_label] = df
+            mod = ARCH_MODULES[arch_name]
+            df = mod.predict_audio_bytes(model=model, cfg=cfg, audio_bytes=audio_bytes, suffix=suffix, hop_sec=hop)
+            dfs_by_model[label] = df
 
     plot_predictions_overlay(dfs_by_model, "dose_smooth", f"Dose (smoothed, window=5): {audio_name}", "Dose", colors)
     plot_predictions_overlay(dfs_by_model, "flow_smooth", f"Flow (smoothed, window=5): {audio_name}", "Flow", colors)
 
     with st.expander("Selected models details"):
         rows = []
-        for model_label, (_m, cfg, arch) in bundle.items():
+        for label, (arch_name, _m, cfg) in bundle.items():
             rows.append({
-                "model": model_label,
-                "arch_group": arch,
+                "model": label,
+                "arch_group": arch_name,
                 "model_type": cfg.get("model_type"),
                 "feature_type": cfg.get("feature_type"),
                 "transform": cfg.get("transformation_method"),
+                "loss_type": cfg.get("loss_type"),
                 "sample_rate": cfg.get("sample_rate"),
                 "noise_length_sec": cfg.get("noise_length_sec"),
                 "frame_length_sec": cfg.get("frame_length_sec"),
