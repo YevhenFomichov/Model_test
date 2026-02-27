@@ -390,11 +390,6 @@ def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict):
 
 
 def _infer_T_D_from_cfg(cfg: dict) -> Tuple[int, int]:
-    """
-    Reliable inference without reading H5 model_config.
-    - T inferred from zero-signal feature extraction (except raw/td_spec_stats -> formula)
-    - D inferred from extracted feature matrix
-    """
     sr = int(cfg.get("sample_rate", 44100))
     win_sec = float(cfg.get("noise_length_sec", 5.0))
     win_len = int(sr * win_sec)
@@ -407,31 +402,30 @@ def _infer_T_D_from_cfg(cfg: dict) -> Tuple[int, int]:
             raise RuntimeError("frame_length_sec invalid")
         T = win_len // frame_len
         X2d, _ = extract_features_from_waveform(audio0, sr, cfg)
-        D = int(X2d.shape[1]) if X2d.ndim == 2 else frame_len
+        D = int(X2d.shape[1]) if getattr(X2d, "ndim", 0) == 2 else frame_len
         return int(T), int(D)
 
-    # librosa features: measure actual T,D on zero signal
     X2d, _ = extract_features_from_waveform(audio0, sr, cfg)
-    if X2d.ndim != 2 or X2d.shape[0] <= 0 or X2d.shape[1] <= 0:
+    if getattr(X2d, "ndim", 0) != 2 or X2d.shape[0] <= 0 or X2d.shape[1] <= 0:
         raise RuntimeError(f"Could not infer (T,D) from feature extraction: shape={getattr(X2d,'shape',None)}")
     return int(X2d.shape[0]), int(X2d.shape[1])
 
 
+# -------------------------
+# Loading
+# -------------------------
 def load_model_and_cfg(model_path: str):
     cfg = build_effective_cfg(model_path)
     diag = diagnose_model_file(model_path)
 
     if diag.get("looks_like_git_lfs_pointer") == "yes":
-        raise RuntimeError(
-            "Model file is a Git LFS pointer, not actual weights.\n"
-            f"Diagnostics: {diag}"
-        )
+        raise RuntimeError(f"Model is a Git LFS pointer, not real weights. Diagnostics: {diag}")
 
     ft = str(cfg.get("feature_type", "raw")).lower()
     if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
-        raise RuntimeError(f"Model requires librosa (feature_type={ft}), but librosa is not installed. Diagnostics: {diag}")
+        raise RuntimeError(f"Model requires librosa but it's not installed. Diagnostics: {diag}")
 
-    # HDF5 path (your case)
+    # Your transformer files are HDF5 but named .keras -> Keras may treat them as zip by extension.
     if diag.get("looks_like_hdf5") == "yes":
         try:
             T, D = _infer_T_D_from_cfg(cfg)
@@ -440,10 +434,20 @@ def load_model_and_cfg(model_path: str):
             model = build_model_transformer_time(in_shape, cfg)
             model.build((None,) + in_shape)
 
-            # Load weights without deserializing model_config
-            model.load_weights(model_path)
+            # IMPORTANT: load_weights may branch by extension; force .h5 suffix.
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
+                tmp_h5 = tmp.name
+            try:
+                shutil.copyfile(model_path, tmp_h5)
+                model.load_weights(tmp_h5)
+            finally:
+                try:
+                    os.remove(tmp_h5)
+                except Exception:
+                    pass
 
             return model, cfg
+
         except Exception as e:
             raise RuntimeError(
                 "Failed to load transformer model from HDF5 via rebuild+load_weights.\n"
@@ -451,7 +455,7 @@ def load_model_and_cfg(model_path: str):
                 f"Diagnostics: {diag}"
             ) from e
 
-    # Zip .keras (if you ever have it)
+    # If you ever get real zip .keras for transformer
     if diag.get("looks_like_zip") == "yes":
         custom_objects = {"TFOpLambda": tf.keras.layers.Lambda, "SlicingOpLambda": tf.keras.layers.Lambda}
         with tf.keras.utils.custom_object_scope(custom_objects):
@@ -462,7 +466,7 @@ def load_model_and_cfg(model_path: str):
 
 
 # -------------------------
-# Inference utilities
+# Inference
 # -------------------------
 def load_audio_mono_from_bytes(audio_bytes: bytes, suffix: str, sr: int) -> np.ndarray:
     with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
