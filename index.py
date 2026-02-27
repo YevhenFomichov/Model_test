@@ -5,7 +5,6 @@ import glob
 import tempfile
 import zipfile
 import shutil
-import inspect
 from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
@@ -17,7 +16,7 @@ from tensorflow.keras import layers, models
 from pydub import AudioSegment
 import matplotlib.pyplot as plt
 
-# Standalone Keras (preferred loader in many Streamlit environments)
+# Standalone Keras (often present in Streamlit envs)
 try:
     import keras  # Keras 3 / standalone
     HAS_KERAS = True
@@ -97,7 +96,7 @@ def normalize_feature_matrix(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
 
 
 # =========================================================
-# Feature extraction (same as training)
+# Feature extraction (as in training)
 # =========================================================
 def extract_logmel(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
@@ -270,7 +269,7 @@ def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict) -> Tup
 
 
 # =========================================================
-# Parse model filename + cfg
+# Model filename parsing + cfg
 # =========================================================
 def infer_train_unit_for_model(model_type: str) -> str:
     mt = str(model_type).lower()
@@ -325,13 +324,6 @@ def build_effective_cfg(model_path: str) -> dict:
         "stft_win_length": None,
 
         "num_mfcc": 13,
-
-        # transformer_time params (only for rebuild fallback)
-        "transformer_d_model": 128,
-        "transformer_num_heads": 4,
-        "transformer_ff_dim": 256,
-        "transformer_num_layers": 3,
-        "dropout_rate": 0.3,
 
         "model_type": "roo_tflite",
         "train_unit": "frame",
@@ -414,51 +406,68 @@ def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
 
 
 # =========================================================
-# Transformer rebuild (fallback when "unsupported callable")
+# Model loader (IMPORTANT FIX: dir ".keras" -> tf loader)
 # =========================================================
-def _transformer_encoder_block(x, num_heads, d_model, ff_dim, dropout):
-    attn = layers.MultiHeadAttention(
-        num_heads=num_heads, key_dim=d_model // max(1, num_heads)
-    )(x, x)
-    attn = layers.Dropout(dropout)(attn)
-    x = layers.LayerNormalization(epsilon=1e-6)(x + attn)
-
-    ff = layers.Dense(ff_dim, activation="relu")(x)
-    ff = layers.Dropout(dropout)(ff)
-    ff = layers.Dense(d_model)(ff)
-    x = layers.LayerNormalization(epsilon=1e-6)(x + ff)
-    return x
+def _enable_unsafe_deser_if_available():
+    if not HAS_KERAS:
+        return
+    try:
+        if hasattr(keras, "config") and hasattr(keras.config, "enable_unsafe_deserialization"):
+            keras.config.enable_unsafe_deserialization()
+    except Exception:
+        pass
 
 
-def build_model_transformer_time(input_shape: Tuple[int, int, int], cfg: dict) -> tf.keras.Model:
-    inp = layers.Input(shape=input_shape)
-    drop = float(cfg.get("dropout_rate", 0.3))
-    T, D, _ = input_shape
-
-    x = layers.Reshape((T, D))(inp)
-    d_model = int(cfg.get("transformer_d_model", 128))
-    num_heads = int(cfg.get("transformer_num_heads", 4))
-    ff_dim = int(cfg.get("transformer_ff_dim", 256))
-    num_layers = int(cfg.get("transformer_num_layers", 3))
-
-    x = layers.Dense(d_model)(x)
-
-    # Use Embedding + explicit positions; implemented via Keras layers to avoid Lambda serialization issues
-    pos_idx = tf.range(start=0, limit=T, delta=1)
-    pos_emb = layers.Embedding(input_dim=max(256, T + 1), output_dim=d_model)(pos_idx)
-    x = x + pos_emb
-
-    for _ in range(num_layers):
-        x = _transformer_encoder_block(x, num_heads=num_heads, d_model=d_model, ff_dim=ff_dim, dropout=drop)
-
-    x = layers.Dense(128)(x)
-    x = layers.LeakyReLU()(x)
-    x = layers.Dropout(drop)(x)
-
-    out = layers.Dense(2, activation="linear", name="dose_flow")(x)
-    return models.Model(inp, out)
+def _get_tfoplambda_class():
+    if HAS_KERAS:
+        cls = getattr(keras.layers, "TFOpLambda", None)
+        if cls is not None:
+            return cls
+        try:
+            from keras.src.layers.core.tf_op_layer import TFOpLambda as K3TFOpLambda  # type: ignore
+            return K3TFOpLambda
+        except Exception:
+            pass
+        try:
+            from keras.layers.core.tf_op_layer import TFOpLambda as K2TFOpLambda  # type: ignore
+            return K2TFOpLambda
+        except Exception:
+            pass
+    return getattr(tf.keras.layers, "TFOpLambda", None)
 
 
+def load_any_keras_model(model_path: str, kind: str) -> tf.keras.Model:
+    """
+    - keras_zip / hdf5 -> prefer standalone keras loader (safe_mode=False) if available
+    - savedmodel_dir  -> MUST use tf.keras.models.load_model (Keras 3 doesn't load SavedModel as model)
+    """
+    tfop = _get_tfoplambda_class()
+    custom_objects = {"TFOpLambda": (tfop if tfop is not None else tf.keras.layers.Lambda)}
+
+    if kind == "savedmodel_dir":
+        # Key fix: directory should be loaded via tf.keras (SavedModel)
+        with tf.keras.utils.custom_object_scope(custom_objects):
+            return tf.keras.models.load_model(model_path, compile=False, custom_objects=custom_objects)
+
+    # For file-based artifacts:
+    if HAS_KERAS:
+        _enable_unsafe_deser_if_available()
+        load_fn = getattr(getattr(keras, "saving", None), "load_model", None) or keras.models.load_model
+        try:
+            with keras.utils.custom_object_scope(custom_objects):
+                return load_fn(model_path, compile=False, custom_objects=custom_objects, safe_mode=False)
+        except TypeError:
+            with keras.utils.custom_object_scope(custom_objects):
+                return load_fn(model_path, compile=False, custom_objects=custom_objects)
+
+    # Fallback to tf.keras for file artifacts
+    with tf.keras.utils.custom_object_scope(custom_objects):
+        return tf.keras.models.load_model(model_path, compile=False, custom_objects=custom_objects)
+
+
+# =========================================================
+# Inference pipeline
+# =========================================================
 def pad_or_trim_1d(x: np.ndarray, target_len: int) -> np.ndarray:
     if len(x) == target_len:
         return x.astype(np.float32, copy=False)
@@ -500,116 +509,6 @@ def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tupl
     return X, info
 
 
-def _extract_weights_path_from_keras_zip(keras_path: str, tmpdir: str) -> str:
-    with zipfile.ZipFile(keras_path, "r") as zf:
-        zf.extractall(tmpdir)
-
-    # Common Keras v3 layout names:
-    # - model.weights.h5
-    # - variables.h5 / weights.h5 (rare)
-    candidates = []
-    for root, _dirs, files in os.walk(tmpdir):
-        for fn in files:
-            lfn = fn.lower()
-            if lfn.endswith(".weights.h5") or lfn == "model.weights.h5" or lfn.endswith("weights.h5"):
-                candidates.append(os.path.join(root, fn))
-
-    if not candidates:
-        raise FileNotFoundError("No weights file found inside .keras archive")
-
-    # Prefer exact model.weights.h5 if present
-    candidates.sort(key=lambda p: (os.path.basename(p).lower() != "model.weights.h5", len(p)))
-    return candidates[0]
-
-
-def rebuild_and_load_transformer_weights(model_path: str, cfg: dict) -> tf.keras.Model:
-    # Determine expected input shape from cfg by running feature pipeline on zeros window
-    sr = int(cfg["sample_rate"])
-    win_len = int(sr * float(cfg["noise_length_sec"]))
-    dummy = np.zeros((win_len,), dtype=np.float32)
-    X, _info = make_model_input_from_audio_window(dummy, cfg)  # (T,D,1)
-    input_shape = tuple(X.shape)
-
-    model = build_model_transformer_time(input_shape=input_shape, cfg=cfg)
-
-    kind, _diag = keras_artifact_kind(model_path)
-    if kind == "keras_zip":
-        with tempfile.TemporaryDirectory() as td:
-            weights_path = _extract_weights_path_from_keras_zip(model_path, td)
-            model.load_weights(weights_path)
-        return model
-
-    if kind == "hdf5":
-        # HDF5 file contains weights groups
-        model.load_weights(model_path)
-        return model
-
-    # savedmodel_dir is unlikely in your setup for ".keras", but keep a clear error
-    raise RuntimeError(f"Unsupported artifact kind for weights-only load: {kind}")
-
-
-# =========================================================
-# Robust loader (normal load_model first; fallback for transformer unsupported callable)
-# =========================================================
-def _enable_unsafe_deser_if_available():
-    if not HAS_KERAS:
-        return
-    try:
-        if hasattr(keras, "config") and hasattr(keras.config, "enable_unsafe_deserialization"):
-            keras.config.enable_unsafe_deserialization()
-    except Exception:
-        pass
-
-
-def _get_tfoplambda_class():
-    if HAS_KERAS:
-        cls = getattr(keras.layers, "TFOpLambda", None)
-        if cls is not None:
-            return cls
-        try:
-            from keras.src.layers.core.tf_op_layer import TFOpLambda as K3TFOpLambda  # type: ignore
-            return K3TFOpLambda
-        except Exception:
-            pass
-        try:
-            from keras.layers.core.tf_op_layer import TFOpLambda as K2TFOpLambda  # type: ignore
-            return K2TFOpLambda
-        except Exception:
-            pass
-    cls = getattr(tf.keras.layers, "TFOpLambda", None)
-    return cls
-
-
-def _load_model_with_tfoplambda(path: str):
-    tfop = _get_tfoplambda_class()
-    if HAS_KERAS:
-        lambda_layer = keras.layers.Lambda
-        scope_ctx = keras.utils.custom_object_scope
-    else:
-        lambda_layer = tf.keras.layers.Lambda
-        scope_ctx = tf.keras.utils.custom_object_scope
-
-    custom_objects = {"TFOpLambda": (tfop if tfop is not None else lambda_layer)}
-
-    # Prefer standalone keras loader (Keras 3)
-    if HAS_KERAS:
-        _enable_unsafe_deser_if_available()
-        load_fn = getattr(getattr(keras, "saving", None), "load_model", None) or keras.models.load_model
-        try:
-            with scope_ctx(custom_objects):
-                return load_fn(path, compile=False, custom_objects=custom_objects, safe_mode=False)
-        except TypeError:
-            with scope_ctx(custom_objects):
-                return load_fn(path, compile=False, custom_objects=custom_objects)
-
-    # Fallback tf.keras
-    with tf.keras.utils.custom_object_scope(custom_objects):
-        return tf.keras.models.load_model(path, compile=False, custom_objects=custom_objects)
-
-
-# =========================================================
-# Inference
-# =========================================================
 def model_predict_frames(model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
     train_unit = str(cfg.get("train_unit", "frame")).lower()
 
@@ -698,6 +597,7 @@ def predict_audio_bytes_for_model(
 # Model discovery
 # =========================================================
 def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str, str, Dict[str, Any]]]]:
+    # glob matches BOTH files and dirs with suffix .keras
     pattern = os.path.join(os.path.abspath(selected_models_dir), "**", "*.keras")
     paths = sorted(glob.glob(pattern, recursive=True))
     paths = [os.path.abspath(p) for p in paths]
@@ -714,7 +614,7 @@ def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str
 
 
 # =========================================================
-# Streamlit caching: model loader + cfg
+# Streamlit caching: load model + cfg
 # =========================================================
 @st.cache_resource(show_spinner=False)
 def load_model_and_cfg(model_path: str):
@@ -740,19 +640,8 @@ def load_model_and_cfg(model_path: str):
             f"Model '{os.path.basename(model_path)}' requires librosa (feature_type={ft}), but librosa is not installed."
         )
 
-    # If HDF5 masquerading as .keras, still OK: detect kind="hdf5" and handle in loader
-    try:
-        model = _load_model_with_tfoplambda(model_path)
-        return model, cfg
-    except Exception as e:
-        msg = str(e)
-
-        # Key fallback: transformer_time sometimes can't be deserialized ("unsupported callable")
-        if cfg.get("model_type", "").lower() == "transformer_time" and ("unsupported callable" in msg.lower()):
-            model = rebuild_and_load_transformer_weights(model_path, cfg)
-            return model, cfg
-
-        raise
+    model = load_any_keras_model(model_path, kind=kind)
+    return model, cfg
 
 
 @st.cache_data(show_spinner=False)
@@ -910,18 +799,3 @@ for up in uploads:
         ylabel="Flow",
         colors=colors,
     )
-
-    with st.expander("Model details (cfg summary)"):
-        rows = []
-        for model_name, (_model, cfg, model_path) in models_cfgs.items():
-            rows.append({
-                "model": model_name,
-                "model_path": model_path,
-                "train_unit": cfg.get("train_unit"),
-                "feature_type": cfg.get("feature_type"),
-                "transform": cfg.get("transformation_method"),
-                "sample_rate": cfg.get("sample_rate"),
-                "noise_length_sec": cfg.get("noise_length_sec"),
-                "frame_length_sec": cfg.get("frame_length_sec"),
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
