@@ -4,6 +4,7 @@ import json
 import zipfile
 import shutil
 import tempfile
+import inspect
 from typing import Optional, Dict, List
 
 import numpy as np
@@ -118,16 +119,72 @@ def is_hdf5_file(path: str) -> bool:
 
 
 def _get_safe_custom_objects():
-    """
-    Fix for deserialization errors like:
-      ValueError: Unknown layer: 'TFOpLambda'
-    Common when TF/Keras versions differ between training and inference env.
-    Mapping these to a plain Lambda is usually sufficient for inference.
-    """
+    # помогает пройти слой TFOpLambda/SlicingOpLambda как "известный" тип
     return {
         "TFOpLambda": tf.keras.layers.Lambda,
         "SlicingOpLambda": tf.keras.layers.Lambda,
     }
+
+
+def _looks_like_unsupported_callable(err: Exception) -> bool:
+    s = f"{type(err).__name__}: {err}".lower()
+    return ("unsupported callable" in s) or ("unsafe" in s and "deserial" in s) or ("lambda" in s and "deserialize" in s)
+
+
+def _load_with_tfkeras(path: str, custom_objects: dict):
+    # tf.keras: safe_mode иногда есть, иногда нет — поэтому пробуем аккуратно
+    with tf.keras.utils.custom_object_scope(custom_objects):
+        try:
+            return tf.keras.models.load_model(path, compile=False)
+        except TypeError as e:
+            # возможно есть safe_mode=False как kwarg (в некоторых окружениях)
+            if "safe_mode" in str(e):
+                return tf.keras.models.load_model(path, compile=False, safe_mode=False)
+            raise
+
+
+def _load_with_keras3(path: str, custom_objects: dict):
+    # keras 3: умеет safe_mode=False / enable_unsafe_deserialization
+    import keras  # noqa
+
+    # enable_unsafe_deserialization() если доступно
+    try:
+        if hasattr(keras, "config") and hasattr(keras.config, "enable_unsafe_deserialization"):
+            keras.config.enable_unsafe_deserialization()
+    except Exception:
+        pass
+
+    # пробуем keras.saving.load_model (preferred)
+    if hasattr(keras, "saving") and hasattr(keras.saving, "load_model"):
+        fn = keras.saving.load_model
+        sig = None
+        try:
+            sig = inspect.signature(fn)
+        except Exception:
+            sig = None
+
+        kwargs = {"compile": False, "custom_objects": custom_objects}
+        if sig is not None and "safe_mode" in sig.parameters:
+            kwargs["safe_mode"] = False
+
+        return fn(path, **kwargs)
+
+    # fallback: keras.models.load_model
+    if hasattr(keras, "models") and hasattr(keras.models, "load_model"):
+        fn = keras.models.load_model
+        sig = None
+        try:
+            sig = inspect.signature(fn)
+        except Exception:
+            sig = None
+
+        kwargs = {"compile": False, "custom_objects": custom_objects}
+        if sig is not None and "safe_mode" in sig.parameters:
+            kwargs["safe_mode"] = False
+
+        return fn(path, **kwargs)
+
+    raise RuntimeError("keras load_model is not available in this environment")
 
 
 def load_model_and_cfg(model_path: str):
@@ -138,24 +195,40 @@ def load_model_and_cfg(model_path: str):
 
     custom_objects = _get_safe_custom_objects()
 
-    # allow HDF5 disguised as .keras
+    # поддержка HDF5, замаскированного под .keras
+    load_path = model_path
+    tmp_path = None
     if (not zipfile.is_zipfile(model_path)) and is_hdf5_file(model_path):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
             tmp_path = tmp.name
+        shutil.copyfile(model_path, tmp_path)
+        load_path = tmp_path
+
+    try:
+        # 1) сначала пробуем tf.keras
         try:
-            shutil.copyfile(model_path, tmp_path)
-            with tf.keras.utils.custom_object_scope(custom_objects):
-                model = tf.keras.models.load_model(tmp_path, compile=False)
-        finally:
+            model = _load_with_tfkeras(load_path, custom_objects)
+            return model, cfg
+        except Exception as e1:
+            # 2) если похожее на unsafe callable / unknown layer — пробуем keras (Keras 3) unsafe
+            if _looks_like_unsupported_callable(e1) or ("unknown layer" in str(e1).lower()) or ("tfolambda" in str(e1).lower()):
+                try:
+                    model = _load_with_keras3(load_path, custom_objects)
+                    return model, cfg
+                except Exception as e2:
+                    # вернуть более информативно
+                    raise RuntimeError(
+                        f"Failed to load transformer model with tf.keras and keras unsafe.\n"
+                        f"tf.keras error: {type(e1).__name__}: {e1}\n"
+                        f"keras error: {type(e2).__name__}: {e2}"
+                    ) from e2
+            raise
+    finally:
+        if tmp_path is not None:
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
-    else:
-        with tf.keras.utils.custom_object_scope(custom_objects):
-            model = tf.keras.models.load_model(model_path, compile=False)
-
-    return model, cfg
 
 
 def load_audio_mono_from_bytes(audio_bytes: bytes, suffix: str, sr: int) -> np.ndarray:
