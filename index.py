@@ -1,9 +1,11 @@
 # index.py
 import os
+import io
 import json
 import glob
 import tempfile
 import zipfile
+import shutil
 from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
@@ -11,17 +13,8 @@ import pandas as pd
 import streamlit as st
 
 import tensorflow as tf
-from tensorflow.keras import layers
 from pydub import AudioSegment
 import matplotlib.pyplot as plt
-
-# Standalone Keras (may be present in Streamlit envs)
-try:
-    import keras  # Keras 3 / standalone
-    HAS_KERAS = True
-except Exception:
-    keras = None
-    HAS_KERAS = False
 
 # Optional librosa
 try:
@@ -35,6 +28,7 @@ SUPPORTED_EXTENSIONS = (".wav", ".m4a", ".mp3", ".flac", ".ogg")
 WINDOW_MODELS = {"cnn2d_resnet", "crnn", "tcn_time", "transformer_time", "dual_branch_time"}
 FRAME_MODELS  = {"basic", "cnn_lstm", "tcn", "multitask", "roo_tflite"}
 
+# Absolute paths relative to THIS file
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
 
@@ -51,7 +45,6 @@ def load_audio_mono_from_path(path: str, sr: int) -> np.ndarray:
     sw = seg.sample_width
     denom = {1: 128.0, 2: 32768.0, 4: 2147483648.0}.get(sw, float(2 ** (8 * sw - 1)))
     return (samples.astype(np.float32) / denom)
-
 
 def transform_audio(audio: np.ndarray, method: Optional[str]) -> np.ndarray:
     if method is None:
@@ -77,14 +70,12 @@ def transform_audio(audio: np.ndarray, method: Optional[str]) -> np.ndarray:
 
     raise ValueError(f"Unsupported transformation: {method}")
 
-
 def frame_audio(audio: np.ndarray, frame_len_samples: int) -> np.ndarray:
     n_frames = len(audio) // frame_len_samples
     if n_frames <= 0:
         return np.zeros((0, frame_len_samples), dtype=np.float32)
     a = audio[:n_frames * frame_len_samples]
     return a.reshape(n_frames, frame_len_samples).astype(np.float32)
-
 
 def normalize_feature_matrix(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     if X.size == 0:
@@ -95,7 +86,7 @@ def normalize_feature_matrix(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
 
 
 # =========================================================
-# Feature extraction
+# Feature extraction (same as training)
 # =========================================================
 def extract_logmel(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
@@ -109,7 +100,6 @@ def extract_logmel(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     mel_db = librosa.power_to_db(mel, ref=np.max)
     return mel_db.T.astype(np.float32)
 
-
 def extract_pcen_mel(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
         raise RuntimeError("librosa required for pcen_mel features")
@@ -122,7 +112,6 @@ def extract_pcen_mel(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     pcen = librosa.pcen(mel * (2**31), sr=sr).astype(np.float32)
     return pcen.T
 
-
 def extract_spectrogram(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
         raise RuntimeError("librosa required for spectrogram features")
@@ -133,7 +122,6 @@ def extract_spectrogram(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     S = librosa.stft(y=audio, n_fft=n_fft, hop_length=hop_length, win_length=win_length)
     return np.abs(S).T.astype(np.float32)
 
-
 def extract_mfcc(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
         raise RuntimeError("librosa required for mfcc features")
@@ -142,7 +130,6 @@ def extract_mfcc(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     hop_length = int(cfg.get("stft_hop_length", 256))
     M = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=n_mfcc, n_fft=n_fft, hop_length=hop_length)
     return M.T.astype(np.float32)
-
 
 def extract_mfcc_deltas(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
@@ -158,14 +145,84 @@ def extract_mfcc_deltas(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     X = np.concatenate([M, d1, d2], axis=0)
     return X.T.astype(np.float32)
 
+def _zcr(frame: np.ndarray) -> float:
+    if frame.size <= 1:
+        return 0.0
+    s = np.sign(frame)
+    s[s == 0] = 1
+    return float(np.mean(s[1:] != s[:-1]))
+
+def _rms(frame: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(frame * frame) + 1e-12))
+
+def _crest_factor(frame: np.ndarray) -> float:
+    rms = _rms(frame)
+    peak = float(np.max(np.abs(frame))) if frame.size else 0.0
+    return float(peak / (rms + 1e-12))
+
+def _teager(frame: np.ndarray) -> float:
+    if frame.size < 3:
+        return 0.0
+    x = frame
+    tke = x[1:-1] * x[1:-1] - x[:-2] * x[2:]
+    return float(np.mean(tke))
+
+def _spectral_stats(frame: np.ndarray, sr: int) -> Tuple[float, float, float]:
+    if frame.size == 0:
+        return 0.0, 0.0, 0.0
+    x = frame.astype(np.float32, copy=False)
+    win = np.hanning(len(x)).astype(np.float32)
+    xw = x * win
+    spec = np.abs(np.fft.rfft(xw)) + 1e-12
+    freqs = np.fft.rfftfreq(len(xw), d=1.0 / sr).astype(np.float32)
+
+    power = spec * spec
+    p_sum = float(np.sum(power))
+    if p_sum <= 0:
+        return 0.0, 0.0, 0.0
+
+    centroid = float(np.sum(freqs * power) / p_sum)
+    gm = float(np.exp(np.mean(np.log(spec))))
+    am = float(np.mean(spec))
+    flatness = float(gm / (am + 1e-12))
+
+    c = np.cumsum(power)
+    thr = 0.85 * c[-1]
+    idx = int(np.searchsorted(c, thr))
+    idx = max(0, min(idx, len(freqs) - 1))
+    rolloff = float(freqs[idx])
+    return centroid, flatness, rolloff
+
+def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict) -> Tuple[np.ndarray, int]:
+    frame_len = int(sr * float(cfg["frame_length_sec"]))
+    Xf = frame_audio(audio, frame_len_samples=frame_len)
+    if Xf.shape[0] == 0:
+        return np.zeros((0, 7), dtype=np.float32), frame_len
+
+    out = np.zeros((Xf.shape[0], 7), dtype=np.float32)
+    for i in range(Xf.shape[0]):
+        fr = Xf[i]
+        c, f, r = _spectral_stats(fr, sr)
+        out[i, 0] = _rms(fr)
+        out[i, 1] = _zcr(fr)
+        out[i, 2] = _crest_factor(fr)
+        out[i, 3] = _teager(fr)
+        out[i, 4] = c
+        out[i, 5] = f
+        out[i, 6] = r
+    return out.astype(np.float32), frame_len
 
 def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict) -> Tuple[np.ndarray, int]:
     ftype = str(cfg.get("feature_type", "raw")).lower()
 
     if ftype == "raw":
-        frame_len = int(sr * float(cfg.get("frame_length_sec", 0.05)))
+        frame_len = int(sr * float(cfg["frame_length_sec"]))
         X = frame_audio(audio, frame_len_samples=frame_len)
         return X.astype(np.float32), frame_len
+
+    if ftype == "td_spec_stats":
+        X, hop = extract_td_spec_stats(audio, sr, cfg)
+        return X.astype(np.float32), hop
 
     if ftype in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(f"feature_type='{ftype}' requires librosa")
@@ -200,7 +257,6 @@ def infer_train_unit_for_model(model_type: str) -> str:
     mt = str(model_type).lower()
     return "window" if mt in WINDOW_MODELS else "frame"
 
-
 def parse_model_filename(model_path: str) -> Dict[str, Optional[str]]:
     base = os.path.basename(model_path)
     if base.lower().endswith(".keras"):
@@ -218,7 +274,6 @@ def parse_model_filename(model_path: str) -> Dict[str, Optional[str]]:
     transform = None if transform == "None" else transform
     return {"model_type": arch, "feature_type": feat, "transformation_method": transform, "loss_type": loss}
 
-
 def find_nearby_config_json(model_path: str) -> Optional[str]:
     d = os.path.dirname(os.path.abspath(model_path))
     cands = sorted(glob.glob(os.path.join(d, "config_*.json")))
@@ -229,7 +284,6 @@ def find_nearby_config_json(model_path: str) -> Optional[str]:
     if os.path.exists(exact):
         return exact
     return cands[0]
-
 
 def build_effective_cfg(model_path: str) -> dict:
     default_cfg = {
@@ -272,77 +326,67 @@ def build_effective_cfg(model_path: str) -> dict:
 
 
 # =========================================================
-# Git LFS pointer detection (optional but helpful)
+# Artifact type detection (zip / dir / hdf5 / lfs)
 # =========================================================
 def is_git_lfs_pointer(path: str) -> bool:
     try:
-        if not os.path.isfile(path):
-            return False
         with open(path, "rb") as f:
             head = f.read(300)
-        return (b"git-lfs.github.com/spec" in head) or (b"oid sha256:" in head)
+        return (b"git-lfs" in head) or (b"version https://git-lfs.github.com/spec" in head) or (b"oid sha256:" in head)
     except Exception:
         return False
 
-
-# =========================================================
-# Loader (core fix)
-# =========================================================
-def _enable_unsafe_deser_if_available():
-    if not HAS_KERAS:
-        return
+def is_hdf5_file(path: str) -> bool:
     try:
-        if hasattr(keras, "config") and hasattr(keras.config, "enable_unsafe_deserialization"):
-            keras.config.enable_unsafe_deserialization()
+        with open(path, "rb") as f:
+            head = f.read(len(HDF5_MAGIC))
+        return head == HDF5_MAGIC
+    except Exception:
+        return False
+
+def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
+    """
+    kind in: keras_zip | savedmodel_dir | hdf5 | missing | lfs_pointer | unknown
+    """
+    p = os.path.abspath(path)
+    diag: Dict[str, Any] = {"path": p}
+
+    if not os.path.exists(p):
+        return "missing", diag
+
+    diag["is_file"] = os.path.isfile(p)
+    diag["is_dir"] = os.path.isdir(p)
+    diag["size_bytes"] = None
+    try:
+        diag["size_bytes"] = os.path.getsize(p) if os.path.isfile(p) else None
     except Exception:
         pass
 
+    if os.path.isfile(p) and is_git_lfs_pointer(p):
+        return "lfs_pointer", diag
 
-def load_model_robust(model_path: str) -> tf.keras.Model:
-    """
-    Robustly loads:
-    - SavedModel directory (even if name endswith .keras) via tf.keras
-    - .keras zip via keras.saving (if available) else tf.keras
-    - Falls back to tf.keras if keras.saving complains about "zip file"
-    """
-    model_path = os.path.abspath(model_path)
+    if os.path.isdir(p):
+        return "savedmodel_dir", diag
 
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model path does not exist: {model_path}")
-
-    # Most important: if it's a directory -> treat as SavedModel
-    if os.path.isdir(model_path):
-        return tf.keras.models.load_model(model_path, compile=False)
-
-    # If it's a file, detect LFS pointer early
-    if is_git_lfs_pointer(model_path):
-        raise RuntimeError(
-            f"'{os.path.basename(model_path)}' looks like a Git LFS pointer, not the real model binary. "
-            f"Make sure LFS files are pulled in the deployment environment."
-        )
-
-    # Prefer standalone Keras loader for .keras zip
-    if HAS_KERAS:
-        _enable_unsafe_deser_if_available()
-        load_fn = getattr(getattr(keras, "saving", None), "load_model", None) or keras.models.load_model
+    if os.path.isfile(p):
+        # zip?
         try:
-            return load_fn(model_path, compile=False, safe_mode=False)
-        except TypeError:
-            # safe_mode not supported
-            return load_fn(model_path, compile=False)
-        except Exception as e:
-            # Key fallback: if Keras 3 says ".keras zip file", try tf.keras loader
-            msg = str(e).lower()
-            if "keras zip file" in msg or "zip file" in msg:
-                return tf.keras.models.load_model(model_path, compile=False)
-            raise
+            diag["is_zipfile"] = zipfile.is_zipfile(p)
+        except Exception:
+            diag["is_zipfile"] = False
+        if diag["is_zipfile"]:
+            return "keras_zip", diag
 
-    # Fallback: tf.keras loader
-    return tf.keras.models.load_model(model_path, compile=False)
+        # hdf5?
+        diag["is_hdf5"] = is_hdf5_file(p)
+        if diag["is_hdf5"]:
+            return "hdf5", diag
+
+    return "unknown", diag
 
 
 # =========================================================
-# Inference pipeline
+# Inference
 # =========================================================
 def pad_or_trim_1d(x: np.ndarray, target_len: int) -> np.ndarray:
     if len(x) == target_len:
@@ -351,7 +395,6 @@ def pad_or_trim_1d(x: np.ndarray, target_len: int) -> np.ndarray:
         return x[:target_len].astype(np.float32, copy=False)
     pad = np.zeros((target_len - len(x),), dtype=np.float32)
     return np.concatenate([x.astype(np.float32, copy=False), pad], axis=0)
-
 
 def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tuple[np.ndarray, Dict[str, Any]]:
     sr = int(cfg["sample_rate"])
@@ -366,8 +409,7 @@ def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tupl
     if ftype != "raw":
         X2d = normalize_feature_matrix(X2d)
 
-    # enforce fixed T for raw framing
-    if ftype == "raw":
+    if ftype in ("raw", "td_spec_stats"):
         frame_len = int(sr * float(cfg["frame_length_sec"]))
         target_frames = win_len // frame_len
         if X2d.shape[0] != target_frames:
@@ -385,12 +427,13 @@ def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tupl
     }
     return X, info
 
-
-def model_predict_frames(model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
+def model_predict_frames(model: tf.keras.Model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
     train_unit = str(cfg.get("train_unit", "frame")).lower()
 
     if train_unit == "frame":
         pred = model.predict(X_t_d_1, verbose=0)
+        if isinstance(pred, (list, tuple)):
+            pred = pred[-1]
         pred = np.asarray(pred)
         if pred.ndim != 2 or pred.shape[1] != 2:
             raise ValueError(f"Unexpected prediction shape for frame model: {pred.shape}")
@@ -398,6 +441,8 @@ def model_predict_frames(model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
 
     if train_unit == "window":
         pred = model.predict(X_t_d_1[None, ...], verbose=0)
+        if isinstance(pred, (list, tuple)):
+            pred = pred[-1]
         pred = np.asarray(pred)
         if pred.ndim == 3 and pred.shape[0] == 1 and pred.shape[2] == 2:
             return pred[0].astype(np.float32)
@@ -405,15 +450,13 @@ def model_predict_frames(model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
 
     raise ValueError(f"Unsupported train_unit: {train_unit}")
 
-
 def rolling_mean_5(x: np.ndarray) -> np.ndarray:
     if x.size == 0:
         return x
     return pd.Series(x).rolling(window=5, min_periods=1, center=True).mean().to_numpy(dtype=np.float32)
 
-
 def predict_audio_bytes_for_model(
-    model,
+    model: tf.keras.Model,
     cfg: dict,
     audio_bytes: bytes,
     audio_suffix: str,
@@ -467,39 +510,66 @@ def predict_audio_bytes_for_model(
 
 
 # =========================================================
-# Model discovery
+# Model discovery + filtering
 # =========================================================
-def discover_models(selected_models_dir: str) -> List[str]:
-    # This glob can match files; for directories named "*.keras" it's still returned on some FS,
-    # but to be safe we also scan directories explicitly.
-    base = os.path.abspath(selected_models_dir)
+def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str, str, Dict[str, Any]]]]:
+    pattern = os.path.join(os.path.abspath(selected_models_dir), "**", "*.keras")
+    paths = sorted(glob.glob(pattern, recursive=True))
+    paths = [os.path.abspath(p) for p in paths]
 
-    paths = set(glob.glob(os.path.join(base, "**", "*.keras"), recursive=True))
-
-    # additionally include directories that endwith .keras
-    for root, dirs, _files in os.walk(base):
-        for d in dirs:
-            if d.lower().endswith(".keras"):
-                paths.add(os.path.join(root, d))
-
-    return sorted(os.path.abspath(p) for p in paths)
+    valid = []
+    skipped = []
+    for p in paths:
+        kind, diag = keras_artifact_kind(p)
+        if kind in ("keras_zip", "savedmodel_dir", "hdf5"):
+            valid.append(p)
+        else:
+            skipped.append((p, kind, diag))
+    return valid, skipped
 
 
 # =========================================================
 # Streamlit caching
 # =========================================================
 @st.cache_resource(show_spinner=False)
-def load_model_and_cfg(model_path: str):
+def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
     model_path = os.path.abspath(model_path)
-    cfg = build_effective_cfg(model_path)
+    kind, diag = keras_artifact_kind(model_path)
 
+    if kind == "missing":
+        raise FileNotFoundError(f"Model path missing: {model_path}")
+    if kind == "lfs_pointer":
+        raise RuntimeError(
+            f"'{os.path.basename(model_path)}' is a Git LFS pointer, not the real model file. diag={diag}"
+        )
+    if kind == "unknown":
+        raise RuntimeError(
+            f"'{os.path.basename(model_path)}' is not a recognized Keras artifact (zip/dir/hdf5). diag={diag}"
+        )
+
+    cfg = build_effective_cfg(model_path)
     ft = str(cfg.get("feature_type", "raw")).lower()
     if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(
             f"Model '{os.path.basename(model_path)}' requires librosa (feature_type={ft}), but librosa is not installed."
         )
 
-    model = load_model_robust(model_path)
+    # Critical fix: if it's HDF5 but named .keras -> load via temp .h5
+    if kind == "hdf5":
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
+            tmp_path = tmp.name
+        try:
+            shutil.copyfile(model_path, tmp_path)
+            model = tf.keras.models.load_model(tmp_path, compile=False)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return model, cfg
+
+    # normal cases
+    model = tf.keras.models.load_model(model_path, compile=False)
     return model, cfg
 
 
@@ -526,7 +596,6 @@ def plot_waveform(t: np.ndarray, x: np.ndarray, title: str):
     ax.grid(True, alpha=0.3)
     st.pyplot(fig, clear_figure=True)
 
-
 def plot_predictions_overlay(
     dfs_by_model: Dict[str, pd.DataFrame],
     y_col: str,
@@ -539,12 +608,8 @@ def plot_predictions_overlay(
     for model_name, df in dfs_by_model.items():
         if df is None or df.empty:
             continue
-        ax.plot(
-            df["time_sec"].to_numpy(),
-            df[y_col].to_numpy(),
-            label=model_name,
-            color=colors.get(model_name, None),
-        )
+        ax.plot(df["time_sec"].to_numpy(), df[y_col].to_numpy(),
+                label=model_name, color=colors.get(model_name, None))
     ax.set_title(title)
     ax.set_xlabel("Time, sec")
     ax.set_ylabel(ylabel)
@@ -559,18 +624,21 @@ def plot_predictions_overlay(
 st.set_page_config(page_title="Inhale inference", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
-model_paths = discover_models(SELECTED_MODELS_DIR)
-if not model_paths:
-    st.error(f"No models found in '{SELECTED_MODELS_DIR}'.")
+valid_model_paths, skipped_models = discover_models(SELECTED_MODELS_DIR)
+
+if not valid_model_paths:
+    st.error(f"No valid model artifacts found in '{SELECTED_MODELS_DIR}'.")
+    if skipped_models:
+        st.code("\n".join([f"{p} -> {kind}" for (p, kind, _d) in skipped_models[:50]]))
     st.stop()
 
-model_labels = {p: os.path.relpath(p, SELECTED_MODELS_DIR) for p in model_paths}
+model_labels = {p: os.path.relpath(p, SELECTED_MODELS_DIR) for p in valid_model_paths}
 
 with st.sidebar:
     st.header("Models")
     chosen = st.multiselect(
         "Select up to 3 models",
-        options=model_paths,
+        options=valid_model_paths,
         format_func=lambda p: model_labels.get(p, os.path.basename(p)),
         default=[],
         max_selections=3,
@@ -591,6 +659,19 @@ with st.sidebar:
         type=[e.replace(".", "") for e in SUPPORTED_EXTENSIONS],
         accept_multiple_files=True,
     )
+
+    st.divider()
+    if st.checkbox("Debug model scan", value=False):
+        st.write("APP_DIR:", APP_DIR)
+        st.write("SELECTED_MODELS_DIR:", SELECTED_MODELS_DIR)
+        st.write("Valid models:", len(valid_model_paths))
+        st.write(valid_model_paths[:10])
+        st.write("Skipped models:", len(skipped_models))
+        if skipped_models:
+            preview = []
+            for p, kind, diag in skipped_models[:20]:
+                preview.append(f"{os.path.relpath(p, SELECTED_MODELS_DIR)} -> {kind} | {diag}")
+            st.code("\n".join(preview))
 
 if not chosen:
     st.info("Select 1–3 models in the sidebar.")
@@ -655,3 +736,20 @@ for up in uploads:
         ylabel="Flow",
         colors=colors,
     )
+
+    with st.expander("Model details (cfg summary)"):
+        rows = []
+        for model_name, (_model, cfg, model_path) in models_cfgs.items():
+            rows.append({
+                "model": model_name,
+                "model_path": model_path,
+                "train_unit": cfg.get("train_unit"),
+                "feature_type": cfg.get("feature_type"),
+                "transform": cfg.get("transformation_method"),
+                "sample_rate": cfg.get("sample_rate"),
+                "noise_length_sec": cfg.get("noise_length_sec"),
+                "frame_length_sec": cfg.get("frame_length_sec"),
+                "hop_length": cfg.get("hop_length"),
+                "stft_hop_length": cfg.get("stft_hop_length"),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
