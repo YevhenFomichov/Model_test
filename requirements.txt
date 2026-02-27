@@ -1,0 +1,3 @@
+pip install streamlit tensorflow pydub matplotlib pandas numpy
+# + librosa если используешь mel/mfcc/etc
+pip install librosa
