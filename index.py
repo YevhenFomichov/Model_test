@@ -16,6 +16,14 @@ import tensorflow as tf
 from pydub import AudioSegment
 import matplotlib.pyplot as plt
 
+# IMPORTANT: use standalone keras loader when available
+try:
+    import keras  # Keras 3 / standalone
+    HAS_KERAS = True
+except Exception:
+    keras = None
+    HAS_KERAS = False
+
 # Optional librosa
 try:
     import librosa
@@ -28,7 +36,6 @@ SUPPORTED_EXTENSIONS = (".wav", ".m4a", ".mp3", ".flac", ".ogg")
 WINDOW_MODELS = {"cnn2d_resnet", "crnn", "tcn_time", "transformer_time", "dual_branch_time"}
 FRAME_MODELS  = {"basic", "cnn_lstm", "tcn", "multitask", "roo_tflite"}
 
-# Absolute paths relative to THIS file
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
 
@@ -383,75 +390,77 @@ def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
 
 
 # =========================================================
-# TFOpLambda compatibility
+# Robust loader for TFOpLambda across Keras/TF variants
 # =========================================================
 def _get_tfoplambda_class():
-    """
-    Try to locate the real TFOpLambda class in this environment.
-    If not found, return None.
-    """
-    # 1) Some TF builds export it here
+    # Try standalone keras locations first (since error clearly comes from keras deserializer)
+    if HAS_KERAS:
+        cls = getattr(keras.layers, "TFOpLambda", None)
+        if cls is not None:
+            return cls
+        try:
+            from keras.src.layers.core.tf_op_layer import TFOpLambda as K3TFOpLambda  # type: ignore
+            return K3TFOpLambda
+        except Exception:
+            pass
+        try:
+            from keras.layers.core.tf_op_layer import TFOpLambda as K2TFOpLambda  # type: ignore
+            return K2TFOpLambda
+        except Exception:
+            pass
+
+    # Then try tf.keras
     cls = getattr(tf.keras.layers, "TFOpLambda", None)
     if cls is not None:
         return cls
 
-    # 2) Keras internal path (varies by version)
-    try:
-        # Keras 3 internal
-        from keras.src.layers.core.tf_op_layer import TFOpLambda as K3TFOpLambda  # type: ignore
-        return K3TFOpLambda
-    except Exception:
-        pass
-
-    try:
-        # Older keras internal
-        from keras.layers.core.tf_op_layer import TFOpLambda as K2TFOpLambda  # type: ignore
-        return K2TFOpLambda
-    except Exception:
-        pass
-
     return None
 
-def _load_model_with_fallbacks(path: str) -> tf.keras.Model:
-    """
-    Robust model loader:
-      - tries load_model normally
-      - then tries with custom_objects + custom_object_scope for TFOpLambda
-      - if load_model supports safe_mode, sets safe_mode=False on fallback
-    """
-    tfop = _get_tfoplambda_class()
-    custom_objects = {}
-    if tfop is not None:
-        custom_objects["TFOpLambda"] = tfop
-    else:
-        # last resort: let it deserialize as a generic Lambda layer
-        custom_objects["TFOpLambda"] = tf.keras.layers.Lambda
-
-    def _call_load_model(kwargs: dict) -> tf.keras.Model:
-        # Some envs use keras.load_model signature with safe_mode; others don't.
-        sig = None
-        try:
-            sig = inspect.signature(tf.keras.models.load_model)
-        except Exception:
-            sig = None
-
-        if sig is not None and "safe_mode" in sig.parameters:
-            # allow unsafe deserialization in fallback
-            kwargs.setdefault("safe_mode", False)
-
-        return tf.keras.models.load_model(path, **kwargs)
-
-    # 1) standard attempt
+def _call_load_model(load_fn, path: str, *, compile_: bool, custom_objects: dict):
+    kwargs = {"compile": compile_, "custom_objects": custom_objects}
     try:
-        return _call_load_model({"compile": False})
-    except Exception as e1:
-        # 2) attempt with custom objects + scope
+        sig = inspect.signature(load_fn)
+        if "safe_mode" in sig.parameters:
+            kwargs["safe_mode"] = False
+    except Exception:
+        pass
+    return load_fn(path, **kwargs)
+
+def _load_model_with_tfoplambda_fallbacks(path: str):
+    tfop = _get_tfoplambda_class()
+
+    # Use Lambda as last resort mapping (only for deserialization; inference only)
+    if HAS_KERAS:
+        lambda_layer = keras.layers.Lambda
+        scope_ctx = keras.utils.custom_object_scope
+        load_fn = keras.models.load_model
+    else:
+        lambda_layer = tf.keras.layers.Lambda
+        scope_ctx = tf.keras.utils.custom_object_scope
+        load_fn = tf.keras.models.load_model
+
+    custom_objects = {"TFOpLambda": (tfop if tfop is not None else lambda_layer)}
+
+    # 1) Try standalone keras loader (preferred)
+    if HAS_KERAS:
         try:
-            with tf.keras.utils.custom_object_scope(custom_objects):
-                return _call_load_model({"compile": False, "custom_objects": custom_objects})
+            with keras.utils.custom_object_scope(custom_objects):
+                return _call_load_model(keras.models.load_model, path, compile_=False, custom_objects=custom_objects)
         except Exception:
-            # raise original error to keep message stable
-            raise e1
+            pass
+
+    # 2) Try tf.keras loader
+    try:
+        with tf.keras.utils.custom_object_scope(custom_objects):
+            return _call_load_model(tf.keras.models.load_model, path, compile_=False, custom_objects=custom_objects)
+    except Exception as e2:
+        # 3) Final attempt: if standalone keras exists but failed above due to scope mismatch, try without scope
+        if HAS_KERAS:
+            try:
+                return _call_load_model(keras.models.load_model, path, compile_=False, custom_objects=custom_objects)
+            except Exception:
+                pass
+        raise e2
 
 
 # =========================================================
@@ -496,7 +505,7 @@ def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tupl
     }
     return X, info
 
-def model_predict_frames(model: tf.keras.Model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
+def model_predict_frames(model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
     train_unit = str(cfg.get("train_unit", "frame")).lower()
 
     if train_unit == "frame":
@@ -525,7 +534,7 @@ def rolling_mean_5(x: np.ndarray) -> np.ndarray:
     return pd.Series(x).rolling(window=5, min_periods=1, center=True).mean().to_numpy(dtype=np.float32)
 
 def predict_audio_bytes_for_model(
-    model: tf.keras.Model,
+    model,
     cfg: dict,
     audio_bytes: bytes,
     audio_suffix: str,
@@ -601,7 +610,7 @@ def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str
 # Streamlit caching
 # =========================================================
 @st.cache_resource(show_spinner=False)
-def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
+def load_model_and_cfg(model_path: str):
     model_path = os.path.abspath(model_path)
     kind, diag = keras_artifact_kind(model_path)
 
@@ -623,13 +632,13 @@ def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
             f"Model '{os.path.basename(model_path)}' requires librosa (feature_type={ft}), but librosa is not installed."
         )
 
-    # HDF5 masquerading as .keras -> load via temp .h5 to trigger proper HDF5 loader
+    # HDF5 masquerading as .keras -> load via temp .h5 (forces correct backend path)
     if kind == "hdf5":
         with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
             tmp_path = tmp.name
         try:
             shutil.copyfile(model_path, tmp_path)
-            model = _load_model_with_fallbacks(tmp_path)
+            model = _load_model_with_tfoplambda_fallbacks(tmp_path)
         finally:
             try:
                 os.remove(tmp_path)
@@ -637,7 +646,7 @@ def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
                 pass
         return model, cfg
 
-    model = _load_model_with_fallbacks(model_path)
+    model = _load_model_with_tfoplambda_fallbacks(model_path)
     return model, cfg
 
 
@@ -676,12 +685,8 @@ def plot_predictions_overlay(
     for model_name, df in dfs_by_model.items():
         if df is None or df.empty:
             continue
-        ax.plot(
-            df["time_sec"].to_numpy(),
-            df[y_col].to_numpy(),
-            label=model_name,
-            color=colors.get(model_name, None),
-        )
+        ax.plot(df["time_sec"].to_numpy(), df[y_col].to_numpy(),
+                label=model_name, color=colors.get(model_name, None))
     ax.set_title(title)
     ax.set_xlabel("Time, sec")
     ax.set_ylabel(ylabel)
@@ -731,19 +736,6 @@ with st.sidebar:
         type=[e.replace(".", "") for e in SUPPORTED_EXTENSIONS],
         accept_multiple_files=True,
     )
-
-    st.divider()
-    if st.checkbox("Debug model scan", value=False):
-        st.write("APP_DIR:", APP_DIR)
-        st.write("SELECTED_MODELS_DIR:", SELECTED_MODELS_DIR)
-        st.write("Valid models:", len(valid_model_paths))
-        st.write(valid_model_paths[:10])
-        st.write("Skipped models:", len(skipped_models))
-        if skipped_models:
-            preview = []
-            for p, kind, diag in skipped_models[:20]:
-                preview.append(f"{os.path.relpath(p, SELECTED_MODELS_DIR)} -> {kind} | {diag}")
-            st.code("\n".join(preview))
 
 if not chosen:
     st.info("Select 1–3 models in the sidebar.")
@@ -801,7 +793,6 @@ for up in uploads:
         ylabel="Dose",
         colors=colors,
     )
-
     plot_predictions_overlay(
         dfs_by_model=dfs_by_model,
         y_col="flow_smooth",
@@ -809,20 +800,3 @@ for up in uploads:
         ylabel="Flow",
         colors=colors,
     )
-
-    with st.expander("Model details (cfg summary)"):
-        rows = []
-        for model_name, (_model, cfg, model_path) in models_cfgs.items():
-            rows.append({
-                "model": model_name,
-                "model_path": model_path,
-                "train_unit": cfg.get("train_unit"),
-                "feature_type": cfg.get("feature_type"),
-                "transform": cfg.get("transformation_method"),
-                "sample_rate": cfg.get("sample_rate"),
-                "noise_length_sec": cfg.get("noise_length_sec"),
-                "frame_length_sec": cfg.get("frame_length_sec"),
-                "hop_length": cfg.get("hop_length"),
-                "stft_hop_length": cfg.get("stft_hop_length"),
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
