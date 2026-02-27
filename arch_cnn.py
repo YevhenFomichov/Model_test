@@ -9,7 +9,17 @@ from typing import Optional, Dict, List
 import numpy as np
 import pandas as pd
 from pydub import AudioSegment
+
 import tensorflow as tf
+
+# ---- IMPORTANT: "warm up" layer imports so deserializer sees them ----
+# In some Keras 3 / TF-Keras setups, standard RNN layers may not be found unless imported.
+from tensorflow.keras import layers as _layers  # noqa: F401
+
+try:
+    import keras as _keras  # noqa: F401
+except Exception:
+    _keras = None
 
 try:
     import librosa
@@ -17,10 +27,9 @@ try:
 except ImportError:
     HAS_LIBROSA = False
 
-ARCH_GROUP = "roo"
-MODEL_TYPES = {"roo_tflite"}
+ARCH_GROUP = "cnn"
+MODEL_TYPES = {"cnn_lstm", "cnn2d_resnet", "crnn"}
 KNOWN_FEATURE_TYPES = {"raw", "td_spec_stats", "logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas"}
-SUPPORTED_AUDIO_EXTENSIONS = (".wav", ".m4a", ".mp3", ".flac", ".ogg")
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 
 
@@ -98,7 +107,7 @@ def build_effective_cfg(model_path: str) -> dict:
         "stft_hop_length": 256,
         "stft_win_length": None,
         "num_mfcc": 13,
-        "model_type": "roo_tflite",
+        "model_type": "cnn_lstm",
         "loss_type": "mse",
     }
     cfg_path = find_nearby_config_json(model_path)
@@ -118,29 +127,86 @@ def is_hdf5_file(path: str) -> bool:
         return False
 
 
+def _cnn_custom_objects() -> dict:
+    """
+    Provide explicit mappings for common layers so Keras deserializer
+    never fails with 'Could not locate class LSTM' in some environments.
+    """
+    co = {
+        # RNNs
+        "LSTM": tf.keras.layers.LSTM,
+        "GRU": tf.keras.layers.GRU,
+        "SimpleRNN": tf.keras.layers.SimpleRNN,
+        "Bidirectional": tf.keras.layers.Bidirectional,
+        # common layers used in these models
+        "Conv1D": tf.keras.layers.Conv1D,
+        "Conv2D": tf.keras.layers.Conv2D,
+        "Dense": tf.keras.layers.Dense,
+        "Dropout": tf.keras.layers.Dropout,
+        "BatchNormalization": tf.keras.layers.BatchNormalization,
+        "LeakyReLU": tf.keras.layers.LeakyReLU,
+        "MaxPooling1D": tf.keras.layers.MaxPooling1D,
+        "MaxPool2D": tf.keras.layers.MaxPool2D,
+        "MaxPooling2D": tf.keras.layers.MaxPooling2D,
+        "Flatten": tf.keras.layers.Flatten,
+        "Reshape": tf.keras.layers.Reshape,
+        "Add": tf.keras.layers.Add,
+        "Concatenate": tf.keras.layers.Concatenate,
+        "GlobalAveragePooling1D": tf.keras.layers.GlobalAveragePooling1D,
+        "MultiHeadAttention": tf.keras.layers.MultiHeadAttention,
+        "LayerNormalization": tf.keras.layers.LayerNormalization,
+        "Embedding": tf.keras.layers.Embedding,
+    }
+    return co
+
+
 def load_model_and_cfg(model_path: str):
     cfg = build_effective_cfg(model_path)
     ft = str(cfg.get("feature_type", "raw")).lower()
     if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(f"Model requires librosa (feature_type={ft}), but librosa is not installed")
 
+    custom_objects = _cnn_custom_objects()
+
+    def _load(path: str):
+        # Keras 3 sometimes needs safe_mode=False for older artifacts
+        try:
+            return tf.keras.models.load_model(path, compile=False, custom_objects=custom_objects)
+        except TypeError:
+            # older TF might not accept custom_objects kw in some combos (rare)
+            return tf.keras.models.load_model(path, compile=False)
+
+    # allow HDF5 disguised as .keras
     if (not zipfile.is_zipfile(model_path)) and is_hdf5_file(model_path):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
             tmp_path = tmp.name
         try:
             shutil.copyfile(model_path, tmp_path)
-            model = tf.keras.models.load_model(tmp_path, compile=False)
+            return _load(tmp_path), cfg
         finally:
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
-    else:
-        model = tf.keras.models.load_model(model_path, compile=False)
 
-    return model, cfg
+    # normal .keras zip
+    try:
+        model = _load(model_path)
+        return model, cfg
+    except Exception as e:
+        # Final fallback for Keras 3 deserialization edge-cases
+        if _keras is not None:
+            try:
+                model = _keras.saving.load_model(model_path, compile=False, custom_objects=custom_objects, safe_mode=False)
+                return model, cfg
+            except Exception:
+                pass
+        raise e
 
 
+# ==============================
+# Audio + preprocessing (as before)
+# ==============================
 def load_audio_mono_from_bytes(audio_bytes: bytes, suffix: str, sr: int) -> np.ndarray:
     with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
         tmp.write(audio_bytes)
@@ -237,87 +303,12 @@ def extract_mfcc_deltas(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     return X.T.astype(np.float32)
 
 
-def _zcr(frame: np.ndarray) -> float:
-    if frame.size <= 1:
-        return 0.0
-    s = np.sign(frame)
-    s[s == 0] = 1
-    return float(np.mean(s[1:] != s[:-1]))
-
-
-def _rms(frame: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(frame * frame) + 1e-12))
-
-
-def _crest_factor(frame: np.ndarray) -> float:
-    rms = _rms(frame)
-    peak = float(np.max(np.abs(frame))) if frame.size else 0.0
-    return float(peak / (rms + 1e-12))
-
-
-def _teager(frame: np.ndarray) -> float:
-    if frame.size < 3:
-        return 0.0
-    x = frame
-    tke = x[1:-1] * x[1:-1] - x[:-2] * x[2:]
-    return float(np.mean(tke))
-
-
-def _spectral_stats(frame: np.ndarray, sr: int):
-    if frame.size == 0:
-        return 0.0, 0.0, 0.0
-    x = frame.astype(np.float32, copy=False)
-    win = np.hanning(len(x)).astype(np.float32)
-    xw = x * win
-    spec = np.abs(np.fft.rfft(xw)) + 1e-12
-    freqs = np.fft.rfftfreq(len(xw), d=1.0 / sr).astype(np.float32)
-
-    power = spec * spec
-    p_sum = float(np.sum(power))
-    if p_sum <= 0:
-        return 0.0, 0.0, 0.0
-
-    centroid = float(np.sum(freqs * power) / p_sum)
-    gm = float(np.exp(np.mean(np.log(spec))))
-    am = float(np.mean(spec))
-    flatness = float(gm / (am + 1e-12))
-
-    c = np.cumsum(power)
-    thr = 0.85 * c[-1]
-    idx = int(np.searchsorted(c, thr))
-    idx = max(0, min(idx, len(freqs) - 1))
-    rolloff = float(freqs[idx])
-    return centroid, flatness, rolloff
-
-
-def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict):
-    frame_len = int(sr * float(cfg["frame_length_sec"]))
-    Xf = frame_audio(audio, frame_len_samples=frame_len)
-    if Xf.shape[0] == 0:
-        return np.zeros((0, 7), dtype=np.float32), frame_len
-    out = np.zeros((Xf.shape[0], 7), dtype=np.float32)
-    for i in range(Xf.shape[0]):
-        fr = Xf[i]
-        c, f, r = _spectral_stats(fr, sr)
-        out[i, 0] = _rms(fr)
-        out[i, 1] = _zcr(fr)
-        out[i, 2] = _crest_factor(fr)
-        out[i, 3] = _teager(fr)
-        out[i, 4] = c
-        out[i, 5] = f
-        out[i, 6] = r
-    return out.astype(np.float32), frame_len
-
-
 def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict):
     ftype = str(cfg.get("feature_type", "raw")).lower()
 
     if ftype == "raw":
         frame_len = int(sr * float(cfg["frame_length_sec"]))
         return frame_audio(audio, frame_len), frame_len
-
-    if ftype == "td_spec_stats":
-        return extract_td_spec_stats(audio, sr, cfg)
 
     if ftype in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(f"feature_type='{ftype}' requires librosa")
@@ -370,14 +361,10 @@ def rolling_mean_5(x: np.ndarray) -> np.ndarray:
     return pd.Series(x).rolling(window=5, min_periods=1, center=True).mean().to_numpy(dtype=np.float32)
 
 
-def predict_audio_bytes(model, cfg: dict, audio_bytes: bytes, suffix: str, hop_sec: Optional[float]) -> pd.DataFrame:
-    # roo_tflite behaves like frame-model
-    sr = int(cfg.get("sample_rate", 44100))
-    audio = load_audio_mono_from_bytes(audio_bytes, suffix, sr)
-
+def _predict_frame(model, cfg: dict, audio: np.ndarray, sr: int, hop_sec: Optional[float]) -> pd.DataFrame:
     in_shape = model.input_shape  # (None, D, 1)
     if not (isinstance(in_shape, (list, tuple)) and len(in_shape) == 3):
-        raise ValueError(f"roo: unexpected input_shape={in_shape}")
+        raise ValueError(f"cnn(frame): unexpected input_shape={in_shape}")
     target_D = int(in_shape[1])
 
     win_sec = float(cfg.get("noise_length_sec", 5.0))
@@ -402,9 +389,8 @@ def predict_audio_bytes(model, cfg: dict, audio_bytes: bytes, suffix: str, hop_s
         if isinstance(pred, (list, tuple)):
             pred = pred[-1]
         pred = np.asarray(pred, dtype=np.float32)
-
         if pred.ndim != 2 or pred.shape[1] != 2:
-            raise ValueError(f"roo: unexpected pred shape {pred.shape}")
+            raise ValueError(f"cnn(frame): unexpected pred shape {pred.shape}")
 
         hop_in_samples = max(1, int(hop_in_samples))
         for i in range(pred.shape[0]):
@@ -419,3 +405,62 @@ def predict_audio_bytes(model, cfg: dict, audio_bytes: bytes, suffix: str, hop_s
         df["dose_smooth"] = rolling_mean_5(df["dose_pred"].to_numpy())
         df["flow_smooth"] = rolling_mean_5(df["flow_pred"].to_numpy())
     return df
+
+
+def _predict_window(model, cfg: dict, audio: np.ndarray, sr: int, hop_sec: Optional[float]) -> pd.DataFrame:
+    in_shape = model.input_shape  # (None, T, D, 1)
+    if not (isinstance(in_shape, (list, tuple)) and len(in_shape) == 4):
+        raise ValueError(f"cnn(window): unexpected input_shape={in_shape}")
+    target_T = int(in_shape[1])
+    target_D = int(in_shape[2])
+
+    win_sec = float(cfg.get("noise_length_sec", 5.0))
+    hop_sec_eff = win_sec if hop_sec is None else float(hop_sec)
+    win_len = int(sr * win_sec)
+    hop_len = max(1, int(sr * hop_sec_eff))
+
+    rows = []
+    for start in range(0, max(1, len(audio)), hop_len):
+        chunk = pad_or_trim_1d(audio[start:start + win_len], win_len)
+        chunk = transform_audio(chunk, cfg.get("transformation_method", None))
+
+        X2d, hop_in_samples = extract_features_from_waveform(chunk, sr, cfg)
+        if str(cfg.get("feature_type", "raw")).lower() != "raw":
+            X2d = normalize_feature_matrix(X2d)
+
+        X2d = pad_or_trim_2d(X2d, target_T, target_D)
+        X = X2d[..., None].astype(np.float32)  # (T,D,1)
+
+        pred = model.predict(X[None, ...], verbose=0)
+        if isinstance(pred, (list, tuple)):
+            pred = pred[-1]
+        pred = np.asarray(pred, dtype=np.float32)
+        if pred.ndim != 3 or pred.shape[1] != target_T or pred.shape[2] != 2:
+            raise ValueError(f"cnn(window): unexpected pred shape {pred.shape}")
+        pred = pred[0]  # (T,2)
+
+        hop_in_samples = max(1, int(hop_in_samples))
+        for i in range(pred.shape[0]):
+            t_s = (start + i * hop_in_samples) / sr
+            rows.append({"time_sec": float(t_s), "dose_pred": float(pred[i, 0]), "flow_pred": float(pred[i, 1])})
+
+        if start + win_len >= len(audio):
+            break
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["dose_smooth"] = rolling_mean_5(df["dose_pred"].to_numpy())
+        df["flow_smooth"] = rolling_mean_5(df["flow_pred"].to_numpy())
+    return df
+
+
+def predict_audio_bytes(model, cfg: dict, audio_bytes: bytes, suffix: str, hop_sec: Optional[float]) -> pd.DataFrame:
+    sr = int(cfg.get("sample_rate", 44100))
+    audio = load_audio_mono_from_bytes(audio_bytes, suffix, sr)
+
+    mt = str(cfg.get("model_type", "")).lower()
+    if mt == "cnn_lstm":
+        return _predict_frame(model, cfg, audio, sr, hop_sec)
+    if mt in ("cnn2d_resnet", "crnn"):
+        return _predict_window(model, cfg, audio, sr, hop_sec)
+    raise ValueError(f"cnn handler got unsupported model_type={mt}")
