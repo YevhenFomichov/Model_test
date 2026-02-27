@@ -4,8 +4,7 @@ import json
 import zipfile
 import shutil
 import tempfile
-import inspect
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,12 +17,16 @@ try:
 except ImportError:
     HAS_LIBROSA = False
 
+
 ARCH_GROUP = "transformer"
 MODEL_TYPES = {"transformer_time"}
 KNOWN_FEATURE_TYPES = {"raw", "td_spec_stats", "logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas"}
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
 
 
+# -------------------------
+# Model discovery / parsing
+# -------------------------
 def list_models(selected_models_dir: str) -> List[str]:
     pattern = os.path.join(os.path.abspath(selected_models_dir), "**", "*.keras")
     paths = sorted(glob.glob(pattern, recursive=True))
@@ -100,6 +103,11 @@ def build_effective_cfg(model_path: str) -> dict:
         "num_mfcc": 13,
         "model_type": "transformer_time",
         "loss_type": "mse",
+        "dropout_rate": 0.3,
+        "transformer_d_model": 128,
+        "transformer_num_heads": 4,
+        "transformer_ff_dim": 256,
+        "transformer_num_layers": 3,
     }
     cfg_path = find_nearby_config_json(model_path)
     if cfg_path is not None:
@@ -118,73 +126,142 @@ def is_hdf5_file(path: str) -> bool:
         return False
 
 
-def _get_safe_custom_objects():
-    # помогает пройти слой TFOpLambda/SlicingOpLambda как "известный" тип
-    return {
-        "TFOpLambda": tf.keras.layers.Lambda,
-        "SlicingOpLambda": tf.keras.layers.Lambda,
-    }
+# -------------------------
+# Transformer architecture (rebuild for weights-only load)
+# -------------------------
+def _transformer_encoder_block(x, num_heads, d_model, ff_dim, dropout):
+    attn = tf.keras.layers.MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=d_model // max(1, num_heads)
+    )(x, x)
+    attn = tf.keras.layers.Dropout(dropout)(attn)
+    x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x + attn)
+
+    ff = tf.keras.layers.Dense(ff_dim, activation="relu")(x)
+    ff = tf.keras.layers.Dropout(dropout)(ff)
+    ff = tf.keras.layers.Dense(d_model)(ff)
+    x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x + ff)
+    return x
 
 
-def _looks_like_unsupported_callable(err: Exception) -> bool:
-    s = f"{type(err).__name__}: {err}".lower()
-    return ("unsupported callable" in s) or ("unsafe" in s and "deserial" in s) or ("lambda" in s and "deserialize" in s)
+def build_model_transformer_time(input_shape: Tuple[int, int, int], cfg: dict) -> tf.keras.Model:
+    inp = tf.keras.layers.Input(shape=input_shape)
+    drop = float(cfg.get("dropout_rate", 0.3))
+    T, D, _ = input_shape
+
+    x = tf.keras.layers.Reshape((T, D))(inp)
+    d_model = int(cfg.get("transformer_d_model", 128))
+    num_heads = int(cfg.get("transformer_num_heads", 4))
+    ff_dim = int(cfg.get("transformer_ff_dim", 256))
+    num_layers = int(cfg.get("transformer_num_layers", 3))
+
+    x = tf.keras.layers.Dense(d_model)(x)
+
+    pos = tf.range(start=0, limit=T, delta=1)
+    pos_emb = tf.keras.layers.Embedding(input_dim=max(256, T + 1), output_dim=d_model)(pos)
+    x = x + pos_emb
+
+    for _ in range(num_layers):
+        x = _transformer_encoder_block(x, num_heads=num_heads, d_model=d_model, ff_dim=ff_dim, dropout=drop)
+
+    x = tf.keras.layers.Dense(128)(x)
+    x = tf.keras.layers.LeakyReLU()(x)
+    x = tf.keras.layers.Dropout(drop)(x)
+
+    out = tf.keras.layers.Dense(2, activation="linear", name="dose_flow")(x)
+    return tf.keras.Model(inp, out)
 
 
-def _load_with_tfkeras(path: str, custom_objects: dict):
-    # tf.keras: safe_mode иногда есть, иногда нет — поэтому пробуем аккуратно
+# -------------------------
+# .keras zip helpers
+# -------------------------
+def _read_keras_zip_json(model_path: str) -> dict:
+    """
+    Read model config JSON directly from .keras zip without deserializing the model.
+    """
+    with zipfile.ZipFile(model_path, "r") as z:
+        # Keras 3 usually has "config.json"
+        if "config.json" in z.namelist():
+            data = z.read("config.json")
+            return json.loads(data.decode("utf-8"))
+        # older variants
+        for name in z.namelist():
+            if name.endswith(".json"):
+                try:
+                    data = z.read(name)
+                    return json.loads(data.decode("utf-8"))
+                except Exception:
+                    pass
+    raise ValueError("No JSON config found inside .keras archive")
+
+
+def _extract_keras_weights_to_temp(model_path: str) -> str:
+    """
+    Extract weights file from .keras zip to a temp folder and return path to weights file.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="keras_weights_")
+    with zipfile.ZipFile(model_path, "r") as z:
+        # Keras 3: "model.weights.h5"
+        cand = None
+        for n in z.namelist():
+            if n.endswith("model.weights.h5") or n.endswith(".weights.h5"):
+                cand = n
+                break
+        if cand is None:
+            # fallback: any .h5 inside archive
+            for n in z.namelist():
+                if n.endswith(".h5"):
+                    cand = n
+                    break
+        if cand is None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise ValueError("No weights .h5 found inside .keras archive")
+
+        z.extract(cand, tmp_dir)
+        return os.path.join(tmp_dir, cand)
+
+
+def _infer_input_shape_from_config_json(cfg_json: dict) -> Optional[Tuple[int, int, int]]:
+    """
+    Try to infer model input shape (T, D, 1) from JSON config.
+    We do NOT load the model, we just parse the JSON.
+    """
+    # Keras 3 format: {"model_config": {...}} or {"config": {...}}
+    root = cfg_json
+    if "model_config" in root:
+        root = root["model_config"]
+    if "config" in root and isinstance(root["config"], dict) and "layers" in root["config"]:
+        mc = root["config"]
+    elif "layers" in root:
+        mc = root
+    else:
+        return None
+
+    layers = mc.get("layers", [])
+    # Find InputLayer
+    for layer in layers:
+        if layer.get("class_name") == "InputLayer":
+            conf = layer.get("config", {})
+            batch_shape = conf.get("batch_shape") or conf.get("batch_input_shape") or conf.get("input_shape")
+            if batch_shape is None:
+                continue
+            # batch_shape like [None, T, D, 1] or (None, T, D, 1)
+            if isinstance(batch_shape, (list, tuple)) and len(batch_shape) == 4:
+                T = int(batch_shape[1])
+                D = int(batch_shape[2])
+                C = int(batch_shape[3])
+                return (T, D, C)
+    return None
+
+
+def _try_load_direct(model_path: str):
+    """
+    Try normal load paths (may fail for transformer due to callable).
+    """
+    # keep minimal custom objects; may help older TF graphs
+    custom_objects = {"TFOpLambda": tf.keras.layers.Lambda, "SlicingOpLambda": tf.keras.layers.Lambda}
     with tf.keras.utils.custom_object_scope(custom_objects):
-        try:
-            return tf.keras.models.load_model(path, compile=False)
-        except TypeError as e:
-            # возможно есть safe_mode=False как kwarg (в некоторых окружениях)
-            if "safe_mode" in str(e):
-                return tf.keras.models.load_model(path, compile=False, safe_mode=False)
-            raise
-
-
-def _load_with_keras3(path: str, custom_objects: dict):
-    # keras 3: умеет safe_mode=False / enable_unsafe_deserialization
-    import keras  # noqa
-
-    # enable_unsafe_deserialization() если доступно
-    try:
-        if hasattr(keras, "config") and hasattr(keras.config, "enable_unsafe_deserialization"):
-            keras.config.enable_unsafe_deserialization()
-    except Exception:
-        pass
-
-    # пробуем keras.saving.load_model (preferred)
-    if hasattr(keras, "saving") and hasattr(keras.saving, "load_model"):
-        fn = keras.saving.load_model
-        sig = None
-        try:
-            sig = inspect.signature(fn)
-        except Exception:
-            sig = None
-
-        kwargs = {"compile": False, "custom_objects": custom_objects}
-        if sig is not None and "safe_mode" in sig.parameters:
-            kwargs["safe_mode"] = False
-
-        return fn(path, **kwargs)
-
-    # fallback: keras.models.load_model
-    if hasattr(keras, "models") and hasattr(keras.models, "load_model"):
-        fn = keras.models.load_model
-        sig = None
-        try:
-            sig = inspect.signature(fn)
-        except Exception:
-            sig = None
-
-        kwargs = {"compile": False, "custom_objects": custom_objects}
-        if sig is not None and "safe_mode" in sig.parameters:
-            kwargs["safe_mode"] = False
-
-        return fn(path, **kwargs)
-
-    raise RuntimeError("keras load_model is not available in this environment")
+        return tf.keras.models.load_model(model_path, compile=False)
 
 
 def load_model_and_cfg(model_path: str):
@@ -193,44 +270,56 @@ def load_model_and_cfg(model_path: str):
     if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(f"Model requires librosa (feature_type={ft}), but librosa is not installed")
 
-    custom_objects = _get_safe_custom_objects()
-
-    # поддержка HDF5, замаскированного под .keras
-    load_path = model_path
-    tmp_path = None
-    if (not zipfile.is_zipfile(model_path)) and is_hdf5_file(model_path):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
-            tmp_path = tmp.name
-        shutil.copyfile(model_path, tmp_path)
-        load_path = tmp_path
-
+    # 1) Fast path: try direct load (works for some envs)
     try:
-        # 1) сначала пробуем tf.keras
+        model = _try_load_direct(model_path)
+        return model, cfg
+    except Exception as e1:
+        # 2) Robust path: weights-only load
         try:
-            model = _load_with_tfkeras(load_path, custom_objects)
-            return model, cfg
-        except Exception as e1:
-            # 2) если похожее на unsafe callable / unknown layer — пробуем keras (Keras 3) unsafe
-            if _looks_like_unsupported_callable(e1) or ("unknown layer" in str(e1).lower()) or ("tfolambda" in str(e1).lower()):
-                try:
-                    model = _load_with_keras3(load_path, custom_objects)
-                    return model, cfg
-                except Exception as e2:
-                    # вернуть более информативно
-                    raise RuntimeError(
-                        f"Failed to load transformer model with tf.keras and keras unsafe.\n"
-                        f"tf.keras error: {type(e1).__name__}: {e1}\n"
-                        f"keras error: {type(e2).__name__}: {e2}"
-                    ) from e2
-            raise
-    finally:
-        if tmp_path is not None:
+            if not zipfile.is_zipfile(model_path):
+                raise RuntimeError(f"Expected .keras zip, got non-zip file: {model_path}")
+
+            cfg_json = _read_keras_zip_json(model_path)
+            in_shape = _infer_input_shape_from_config_json(cfg_json)
+            if in_shape is None:
+                raise RuntimeError("Could not infer input_shape from .keras JSON config")
+
+            # rebuild architecture
+            if str(cfg.get("model_type", "")).lower() != "transformer_time":
+                raise RuntimeError(f"Unexpected model_type for this loader: {cfg.get('model_type')}")
+
+            model = build_model_transformer_time(in_shape, cfg)
+            model.build((None,) + tuple(in_shape))
+
+            # extract and load weights
+            wpath = _extract_keras_weights_to_temp(model_path)
             try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+                model.load_weights(wpath)
+            finally:
+                # cleanup temp dir that contains weights
+                tmp_dir = os.path.dirname(os.path.dirname(wpath)) if os.path.basename(os.path.dirname(wpath)) != "" else os.path.dirname(wpath)
+                # safer cleanup: remove root temp folder created by mkdtemp prefix
+                # (we stored it as the first folder in path)
+                # wpath is like /tmp/keras_weights_xxx/<inside_zip_path>/model.weights.h5
+                root_tmp = wpath.split(os.sep)
+                # simple + safe: remove the mkdtemp folder by walking up until prefix matches
+                # but easiest: just remove mkdtemp itself
+                # It is the first component after /tmp... we stored in mkdtemp, so:
+                shutil.rmtree(os.path.dirname(wpath).split(os.sep)[0] if False else os.path.dirname(wpath), ignore_errors=True)
+            return model, cfg
+
+        except Exception as e2:
+            raise RuntimeError(
+                f"Failed to load transformer model.\n"
+                f"Direct load error: {type(e1).__name__}: {e1}\n"
+                f"Weights-only load error: {type(e2).__name__}: {e2}"
+            ) from e2
 
 
+# -------------------------
+# Audio + features (same logic as training)
+# -------------------------
 def load_audio_mono_from_bytes(audio_bytes: bytes, suffix: str, sr: int) -> np.ndarray:
     with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
         tmp.write(audio_bytes)
@@ -436,6 +525,9 @@ def rolling_mean_5(x: np.ndarray) -> np.ndarray:
     return pd.Series(x).rolling(window=5, min_periods=1, center=True).mean().to_numpy(dtype=np.float32)
 
 
+# -------------------------
+# Inference
+# -------------------------
 def predict_audio_bytes(model, cfg: dict, audio_bytes: bytes, suffix: str, hop_sec: Optional[float]) -> pd.DataFrame:
     sr = int(cfg.get("sample_rate", 44100))
     audio = load_audio_mono_from_bytes(audio_bytes, suffix, sr)
@@ -467,8 +559,10 @@ def predict_audio_bytes(model, cfg: dict, audio_bytes: bytes, suffix: str, hop_s
         if isinstance(pred, (list, tuple)):
             pred = pred[-1]
         pred = np.asarray(pred, dtype=np.float32)
+
         if pred.ndim != 3 or pred.shape[1] != target_T or pred.shape[2] != 2:
             raise ValueError(f"transformer: unexpected pred shape {pred.shape}")
+
         pred = pred[0]
 
         hop_in_samples = max(1, int(hop_in_samples))
