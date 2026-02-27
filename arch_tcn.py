@@ -17,10 +17,29 @@ try:
 except ImportError:
     HAS_LIBROSA = False
 
-ARCH_GROUP = "cnn"
-MODEL_TYPES = {"cnn_lstm", "cnn2d_resnet", "crnn"}
+ARCH_GROUP = "tcn"
+
+MODEL_TYPES = {
+    "tcn",
+    "tcn_time",
+    "tcn-time",
+    "tcn1",     # если так назвали
+    "tcn2",     # если так назвали
+}
+
 KNOWN_FEATURE_TYPES = {"raw", "td_spec_stats", "logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas"}
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+
+
+def _canon_model_type(s: str) -> str:
+    s = (s or "").strip().lower().replace("-", "_")
+    # алиасы для frame tcn
+    if s in ("tcn", "tcn1", "tcn2", "tcn_model"):
+        return "tcn"
+    # алиасы для window tcn
+    if s in ("tcn_time", "tcn_time_model", "tcn_time_v2"):
+        return "tcn_time"
+    return s
 
 
 def list_models(selected_models_dir: str) -> List[str]:
@@ -30,7 +49,7 @@ def list_models(selected_models_dir: str) -> List[str]:
     for p in paths:
         try:
             info = parse_model_filename(p)
-            if info["model_type"] in MODEL_TYPES:
+            if _canon_model_type(info["model_type"]) in ("tcn", "tcn_time"):
                 out.append(os.path.abspath(p))
         except Exception:
             continue
@@ -40,7 +59,7 @@ def list_models(selected_models_dir: str) -> List[str]:
 def can_handle_model(model_path: str) -> bool:
     try:
         info = parse_model_filename(model_path)
-        return info["model_type"] in MODEL_TYPES
+        return _canon_model_type(info["model_type"]) in ("tcn", "tcn_time")
     except Exception:
         return False
 
@@ -59,11 +78,13 @@ def parse_model_filename(model_path: str) -> Dict[str, Optional[str]]:
     if feat_idx is None or feat_idx == 0 or feat_idx + 2 >= len(parts):
         raise ValueError(f"Can't parse model filename: {os.path.basename(model_path)}")
 
-    model_type = "_".join(parts[:feat_idx]).lower()
+    model_type = "_".join(parts[:feat_idx]).lower().replace("-", "_")
     feature_type = parts[feat_idx].lower()
     transform = parts[feat_idx + 1]
     loss = "_".join(parts[feat_idx + 2:])
     transform = None if transform == "None" else transform
+
+    model_type = _canon_model_type(model_type)
 
     return {
         "model_type": model_type,
@@ -97,14 +118,16 @@ def build_effective_cfg(model_path: str) -> dict:
         "stft_hop_length": 256,
         "stft_win_length": None,
         "num_mfcc": 13,
-        "model_type": "cnn_lstm",
+        "model_type": "tcn",
         "loss_type": "mse",
     }
     cfg_path = find_nearby_config_json(model_path)
     if cfg_path is not None:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg.update(json.load(f))
+
     cfg.update(parse_model_filename(model_path))
+    cfg["model_type"] = _canon_model_type(cfg.get("model_type"))
     return cfg
 
 
@@ -236,87 +259,12 @@ def extract_mfcc_deltas(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     return X.T.astype(np.float32)
 
 
-def _zcr(frame: np.ndarray) -> float:
-    if frame.size <= 1:
-        return 0.0
-    s = np.sign(frame)
-    s[s == 0] = 1
-    return float(np.mean(s[1:] != s[:-1]))
-
-
-def _rms(frame: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(frame * frame) + 1e-12))
-
-
-def _crest_factor(frame: np.ndarray) -> float:
-    rms = _rms(frame)
-    peak = float(np.max(np.abs(frame))) if frame.size else 0.0
-    return float(peak / (rms + 1e-12))
-
-
-def _teager(frame: np.ndarray) -> float:
-    if frame.size < 3:
-        return 0.0
-    x = frame
-    tke = x[1:-1] * x[1:-1] - x[:-2] * x[2:]
-    return float(np.mean(tke))
-
-
-def _spectral_stats(frame: np.ndarray, sr: int):
-    if frame.size == 0:
-        return 0.0, 0.0, 0.0
-    x = frame.astype(np.float32, copy=False)
-    win = np.hanning(len(x)).astype(np.float32)
-    xw = x * win
-    spec = np.abs(np.fft.rfft(xw)) + 1e-12
-    freqs = np.fft.rfftfreq(len(xw), d=1.0 / sr).astype(np.float32)
-
-    power = spec * spec
-    p_sum = float(np.sum(power))
-    if p_sum <= 0:
-        return 0.0, 0.0, 0.0
-
-    centroid = float(np.sum(freqs * power) / p_sum)
-    gm = float(np.exp(np.mean(np.log(spec))))
-    am = float(np.mean(spec))
-    flatness = float(gm / (am + 1e-12))
-
-    c = np.cumsum(power)
-    thr = 0.85 * c[-1]
-    idx = int(np.searchsorted(c, thr))
-    idx = max(0, min(idx, len(freqs) - 1))
-    rolloff = float(freqs[idx])
-    return centroid, flatness, rolloff
-
-
-def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict):
-    frame_len = int(sr * float(cfg["frame_length_sec"]))
-    Xf = frame_audio(audio, frame_len_samples=frame_len)
-    if Xf.shape[0] == 0:
-        return np.zeros((0, 7), dtype=np.float32), frame_len
-    out = np.zeros((Xf.shape[0], 7), dtype=np.float32)
-    for i in range(Xf.shape[0]):
-        fr = Xf[i]
-        c, f, r = _spectral_stats(fr, sr)
-        out[i, 0] = _rms(fr)
-        out[i, 1] = _zcr(fr)
-        out[i, 2] = _crest_factor(fr)
-        out[i, 3] = _teager(fr)
-        out[i, 4] = c
-        out[i, 5] = f
-        out[i, 6] = r
-    return out.astype(np.float32), frame_len
-
-
 def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict):
     ftype = str(cfg.get("feature_type", "raw")).lower()
 
     if ftype == "raw":
         frame_len = int(sr * float(cfg["frame_length_sec"]))
         return frame_audio(audio, frame_len), frame_len
-
-    if ftype == "td_spec_stats":
-        return extract_td_spec_stats(audio, sr, cfg)
 
     if ftype in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(f"feature_type='{ftype}' requires librosa")
@@ -346,8 +294,6 @@ def pad_or_trim_1d(x: np.ndarray, target_len: int) -> np.ndarray:
 
 def pad_or_trim_2d(X: np.ndarray, target_T: int, target_D: int) -> np.ndarray:
     X = np.asarray(X, dtype=np.float32)
-    if X.ndim != 2:
-        raise ValueError("Expected 2D feature matrix")
     T, D = X.shape
     if D != target_D:
         if D > target_D:
@@ -372,7 +318,7 @@ def rolling_mean_5(x: np.ndarray) -> np.ndarray:
 def _predict_frame(model, cfg: dict, audio: np.ndarray, sr: int, hop_sec: Optional[float]) -> pd.DataFrame:
     in_shape = model.input_shape  # (None, D, 1)
     if not (isinstance(in_shape, (list, tuple)) and len(in_shape) == 3):
-        raise ValueError(f"cnn(frame): unexpected input_shape={in_shape}")
+        raise ValueError(f"tcn(frame): unexpected input_shape={in_shape}")
     target_D = int(in_shape[1])
 
     win_sec = float(cfg.get("noise_length_sec", 5.0))
@@ -398,7 +344,7 @@ def _predict_frame(model, cfg: dict, audio: np.ndarray, sr: int, hop_sec: Option
             pred = pred[-1]
         pred = np.asarray(pred, dtype=np.float32)
         if pred.ndim != 2 or pred.shape[1] != 2:
-            raise ValueError(f"cnn(frame): unexpected pred shape {pred.shape}")
+            raise ValueError(f"tcn(frame): unexpected pred shape {pred.shape}")
 
         hop_in_samples = max(1, int(hop_in_samples))
         for i in range(pred.shape[0]):
@@ -418,7 +364,7 @@ def _predict_frame(model, cfg: dict, audio: np.ndarray, sr: int, hop_sec: Option
 def _predict_window(model, cfg: dict, audio: np.ndarray, sr: int, hop_sec: Optional[float]) -> pd.DataFrame:
     in_shape = model.input_shape  # (None, T, D, 1)
     if not (isinstance(in_shape, (list, tuple)) and len(in_shape) == 4):
-        raise ValueError(f"cnn(window): unexpected input_shape={in_shape}")
+        raise ValueError(f"tcn(window): unexpected input_shape={in_shape}")
     target_T = int(in_shape[1])
     target_D = int(in_shape[2])
 
@@ -437,15 +383,15 @@ def _predict_window(model, cfg: dict, audio: np.ndarray, sr: int, hop_sec: Optio
             X2d = normalize_feature_matrix(X2d)
 
         X2d = pad_or_trim_2d(X2d, target_T, target_D)
-        X = X2d[..., None].astype(np.float32)  # (T,D,1)
+        X = X2d[..., None].astype(np.float32)
 
         pred = model.predict(X[None, ...], verbose=0)
         if isinstance(pred, (list, tuple)):
             pred = pred[-1]
         pred = np.asarray(pred, dtype=np.float32)
         if pred.ndim != 3 or pred.shape[1] != target_T or pred.shape[2] != 2:
-            raise ValueError(f"cnn(window): unexpected pred shape {pred.shape}")
-        pred = pred[0]  # (T,2)
+            raise ValueError(f"tcn(window): unexpected pred shape {pred.shape}")
+        pred = pred[0]
 
         hop_in_samples = max(1, int(hop_in_samples))
         for i in range(pred.shape[0]):
@@ -466,9 +412,9 @@ def predict_audio_bytes(model, cfg: dict, audio_bytes: bytes, suffix: str, hop_s
     sr = int(cfg.get("sample_rate", 44100))
     audio = load_audio_mono_from_bytes(audio_bytes, suffix, sr)
 
-    mt = str(cfg.get("model_type", "")).lower()
-    if mt == "cnn_lstm":
+    mt = _canon_model_type(str(cfg.get("model_type", "")))
+    if mt == "tcn":
         return _predict_frame(model, cfg, audio, sr, hop_sec)
-    if mt in ("cnn2d_resnet", "crnn"):
+    if mt == "tcn_time":
         return _predict_window(model, cfg, audio, sr, hop_sec)
-    raise ValueError(f"cnn handler got unsupported model_type={mt}")
+    raise ValueError(f"tcn handler got unsupported model_type={mt}")
