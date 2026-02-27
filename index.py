@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 import tensorflow as tf
+from tensorflow.keras import layers, models
 from pydub import AudioSegment
 import matplotlib.pyplot as plt
 
@@ -36,7 +37,6 @@ SUPPORTED_EXTENSIONS = (".wav", ".m4a", ".mp3", ".flac", ".ogg")
 WINDOW_MODELS = {"cnn2d_resnet", "crnn", "tcn_time", "transformer_time", "dual_branch_time"}
 FRAME_MODELS  = {"basic", "cnn_lstm", "tcn", "multitask", "roo_tflite"}
 
-# Absolute paths relative to THIS file
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
 
@@ -161,59 +161,6 @@ def extract_mfcc_deltas(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     return X.T.astype(np.float32)
 
 
-def _zcr(frame: np.ndarray) -> float:
-    if frame.size <= 1:
-        return 0.0
-    s = np.sign(frame)
-    s[s == 0] = 1
-    return float(np.mean(s[1:] != s[:-1]))
-
-
-def _rms(frame: np.ndarray) -> float:
-    return float(np.sqrt(np.mean(frame * frame) + 1e-12))
-
-
-def _crest_factor(frame: np.ndarray) -> float:
-    rms = _rms(frame)
-    peak = float(np.max(np.abs(frame))) if frame.size else 0.0
-    return float(peak / (rms + 1e-12))
-
-
-def _teager(frame: np.ndarray) -> float:
-    if frame.size < 3:
-        return 0.0
-    x = frame
-    tke = x[1:-1] * x[1:-1] - x[:-2] * x[2:]
-    return float(np.mean(tke))
-
-
-def _spectral_stats(frame: np.ndarray, sr: int) -> Tuple[float, float, float]:
-    if frame.size == 0:
-        return 0.0, 0.0, 0.0
-    x = frame.astype(np.float32, copy=False)
-    win = np.hanning(len(x)).astype(np.float32)
-    xw = x * win
-    spec = np.abs(np.fft.rfft(xw)) + 1e-12
-    freqs = np.fft.rfftfreq(len(xw), d=1.0 / sr).astype(np.float32)
-
-    power = spec * spec
-    p_sum = float(np.sum(power))
-    if p_sum <= 0:
-        return 0.0, 0.0, 0.0
-
-    centroid = float(np.sum(freqs * power) / p_sum)
-    gm = float(np.exp(np.mean(np.log(spec))))
-    am = float(np.mean(spec))
-    flatness = float(gm / (am + 1e-12))
-
-    c = np.cumsum(power)
-    thr = 0.85 * c[-1]
-    idx = int(np.searchsorted(c, thr))
-    idx = max(0, min(idx, len(freqs) - 1))
-    rolloff = float(freqs[idx])
-    return centroid, flatness, rolloff
-
-
 def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict) -> Tuple[np.ndarray, int]:
     frame_len = int(sr * float(cfg["frame_length_sec"]))
     Xf = frame_audio(audio, frame_len_samples=frame_len)
@@ -221,6 +168,55 @@ def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict) -> Tuple[np.nda
         return np.zeros((0, 7), dtype=np.float32), frame_len
 
     out = np.zeros((Xf.shape[0], 7), dtype=np.float32)
+
+    def _zcr(frame: np.ndarray) -> float:
+        if frame.size <= 1:
+            return 0.0
+        s = np.sign(frame)
+        s[s == 0] = 1
+        return float(np.mean(s[1:] != s[:-1]))
+
+    def _rms(frame: np.ndarray) -> float:
+        return float(np.sqrt(np.mean(frame * frame) + 1e-12))
+
+    def _crest_factor(frame: np.ndarray) -> float:
+        rms = _rms(frame)
+        peak = float(np.max(np.abs(frame))) if frame.size else 0.0
+        return float(peak / (rms + 1e-12))
+
+    def _teager(frame: np.ndarray) -> float:
+        if frame.size < 3:
+            return 0.0
+        x = frame
+        tke = x[1:-1] * x[1:-1] - x[:-2] * x[2:]
+        return float(np.mean(tke))
+
+    def _spectral_stats(frame: np.ndarray, sr_: int) -> Tuple[float, float, float]:
+        if frame.size == 0:
+            return 0.0, 0.0, 0.0
+        x = frame.astype(np.float32, copy=False)
+        win = np.hanning(len(x)).astype(np.float32)
+        xw = x * win
+        spec = np.abs(np.fft.rfft(xw)) + 1e-12
+        freqs = np.fft.rfftfreq(len(xw), d=1.0 / sr_).astype(np.float32)
+
+        power = spec * spec
+        p_sum = float(np.sum(power))
+        if p_sum <= 0:
+            return 0.0, 0.0, 0.0
+
+        centroid = float(np.sum(freqs * power) / p_sum)
+        gm = float(np.exp(np.mean(np.log(spec))))
+        am = float(np.mean(spec))
+        flatness = float(gm / (am + 1e-12))
+
+        c = np.cumsum(power)
+        thr = 0.85 * c[-1]
+        idx = int(np.searchsorted(c, thr))
+        idx = max(0, min(idx, len(freqs) - 1))
+        rolloff = float(freqs[idx])
+        return centroid, flatness, rolloff
+
     for i in range(Xf.shape[0]):
         fr = Xf[i]
         c, f, r = _spectral_stats(fr, sr)
@@ -231,6 +227,7 @@ def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict) -> Tuple[np.nda
         out[i, 4] = c
         out[i, 5] = f
         out[i, 6] = r
+
     return out.astype(np.float32), frame_len
 
 
@@ -273,7 +270,7 @@ def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict) -> Tup
 
 
 # =========================================================
-# Model filename parsing + cfg
+# Parse model filename + cfg
 # =========================================================
 def infer_train_unit_for_model(model_type: str) -> str:
     mt = str(model_type).lower()
@@ -311,7 +308,6 @@ def find_nearby_config_json(model_path: str) -> Optional[str]:
 
 
 def build_effective_cfg(model_path: str) -> dict:
-    # Conservative defaults (do not change hyperparams; only inference-relevant)
     default_cfg = {
         "sample_rate": 44100,
         "frame_length_sec": 0.05,
@@ -329,6 +325,13 @@ def build_effective_cfg(model_path: str) -> dict:
         "stft_win_length": None,
 
         "num_mfcc": 13,
+
+        # transformer_time params (only for rebuild fallback)
+        "transformer_d_model": 128,
+        "transformer_num_heads": 4,
+        "transformer_ff_dim": 256,
+        "transformer_num_layers": 3,
+        "dropout_rate": 0.3,
 
         "model_type": "roo_tflite",
         "train_unit": "frame",
@@ -352,7 +355,7 @@ def build_effective_cfg(model_path: str) -> dict:
 
 
 # =========================================================
-# Artifact type detection
+# Artifact detection
 # =========================================================
 def is_git_lfs_pointer(path: str) -> bool:
     try:
@@ -411,86 +414,51 @@ def keras_artifact_kind(path: str) -> Tuple[str, Dict[str, Any]]:
 
 
 # =========================================================
-# Robust loader for TFOpLambda / callable deserialization
+# Transformer rebuild (fallback when "unsupported callable")
 # =========================================================
-def _enable_unsafe_deser_if_available():
-    if not HAS_KERAS:
-        return
-    try:
-        if hasattr(keras, "config") and hasattr(keras.config, "enable_unsafe_deserialization"):
-            keras.config.enable_unsafe_deserialization()
-    except Exception:
-        pass
+def _transformer_encoder_block(x, num_heads, d_model, ff_dim, dropout):
+    attn = layers.MultiHeadAttention(
+        num_heads=num_heads, key_dim=d_model // max(1, num_heads)
+    )(x, x)
+    attn = layers.Dropout(dropout)(attn)
+    x = layers.LayerNormalization(epsilon=1e-6)(x + attn)
+
+    ff = layers.Dense(ff_dim, activation="relu")(x)
+    ff = layers.Dropout(dropout)(ff)
+    ff = layers.Dense(d_model)(ff)
+    x = layers.LayerNormalization(epsilon=1e-6)(x + ff)
+    return x
 
 
-def _get_tfoplambda_class():
-    # Prefer standalone keras locations
-    if HAS_KERAS:
-        cls = getattr(keras.layers, "TFOpLambda", None)
-        if cls is not None:
-            return cls
-        try:
-            from keras.src.layers.core.tf_op_layer import TFOpLambda as K3TFOpLambda  # type: ignore
-            return K3TFOpLambda
-        except Exception:
-            pass
-        try:
-            from keras.layers.core.tf_op_layer import TFOpLambda as K2TFOpLambda  # type: ignore
-            return K2TFOpLambda
-        except Exception:
-            pass
+def build_model_transformer_time(input_shape: Tuple[int, int, int], cfg: dict) -> tf.keras.Model:
+    inp = layers.Input(shape=input_shape)
+    drop = float(cfg.get("dropout_rate", 0.3))
+    T, D, _ = input_shape
 
-    # Then tf.keras
-    cls = getattr(tf.keras.layers, "TFOpLambda", None)
-    if cls is not None:
-        return cls
+    x = layers.Reshape((T, D))(inp)
+    d_model = int(cfg.get("transformer_d_model", 128))
+    num_heads = int(cfg.get("transformer_num_heads", 4))
+    ff_dim = int(cfg.get("transformer_ff_dim", 256))
+    num_layers = int(cfg.get("transformer_num_layers", 3))
 
-    return None
+    x = layers.Dense(d_model)(x)
 
+    # Use Embedding + explicit positions; implemented via Keras layers to avoid Lambda serialization issues
+    pos_idx = tf.range(start=0, limit=T, delta=1)
+    pos_emb = layers.Embedding(input_dim=max(256, T + 1), output_dim=d_model)(pos_idx)
+    x = x + pos_emb
 
-def _load_model_with_tfoplambda_fallbacks(path: str):
-    tfop = _get_tfoplambda_class()
+    for _ in range(num_layers):
+        x = _transformer_encoder_block(x, num_heads=num_heads, d_model=d_model, ff_dim=ff_dim, dropout=drop)
 
-    # Map TFOpLambda to real class if exists, else to Lambda (last resort)
-    if HAS_KERAS:
-        lambda_layer = keras.layers.Lambda
-        scope_ctx = keras.utils.custom_object_scope
-    else:
-        lambda_layer = tf.keras.layers.Lambda
-        scope_ctx = tf.keras.utils.custom_object_scope
+    x = layers.Dense(128)(x)
+    x = layers.LeakyReLU()(x)
+    x = layers.Dropout(drop)(x)
 
-    custom_objects = {"TFOpLambda": (tfop if tfop is not None else lambda_layer)}
-
-    # 1) Preferred: standalone keras saving loader with safe_mode=False
-    if HAS_KERAS:
-        _enable_unsafe_deser_if_available()
-
-        load_fn = None
-        try:
-            load_fn = keras.saving.load_model  # type: ignore[attr-defined]
-        except Exception:
-            load_fn = None
-        if load_fn is None:
-            load_fn = keras.models.load_model
-
-        try:
-            with scope_ctx(custom_objects):
-                return load_fn(path, compile=False, custom_objects=custom_objects, safe_mode=False)
-        except TypeError:
-            # safe_mode not supported
-            with scope_ctx(custom_objects):
-                return load_fn(path, compile=False, custom_objects=custom_objects)
-        except Exception:
-            pass  # continue to tf.keras fallback
-
-    # 2) Fallback: tf.keras loader with custom_objects
-    with tf.keras.utils.custom_object_scope(custom_objects):
-        return tf.keras.models.load_model(path, compile=False, custom_objects=custom_objects)
+    out = layers.Dense(2, activation="linear", name="dose_flow")(x)
+    return models.Model(inp, out)
 
 
-# =========================================================
-# Inference
-# =========================================================
 def pad_or_trim_1d(x: np.ndarray, target_len: int) -> np.ndarray:
     if len(x) == target_len:
         return x.astype(np.float32, copy=False)
@@ -532,6 +500,116 @@ def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tupl
     return X, info
 
 
+def _extract_weights_path_from_keras_zip(keras_path: str, tmpdir: str) -> str:
+    with zipfile.ZipFile(keras_path, "r") as zf:
+        zf.extractall(tmpdir)
+
+    # Common Keras v3 layout names:
+    # - model.weights.h5
+    # - variables.h5 / weights.h5 (rare)
+    candidates = []
+    for root, _dirs, files in os.walk(tmpdir):
+        for fn in files:
+            lfn = fn.lower()
+            if lfn.endswith(".weights.h5") or lfn == "model.weights.h5" or lfn.endswith("weights.h5"):
+                candidates.append(os.path.join(root, fn))
+
+    if not candidates:
+        raise FileNotFoundError("No weights file found inside .keras archive")
+
+    # Prefer exact model.weights.h5 if present
+    candidates.sort(key=lambda p: (os.path.basename(p).lower() != "model.weights.h5", len(p)))
+    return candidates[0]
+
+
+def rebuild_and_load_transformer_weights(model_path: str, cfg: dict) -> tf.keras.Model:
+    # Determine expected input shape from cfg by running feature pipeline on zeros window
+    sr = int(cfg["sample_rate"])
+    win_len = int(sr * float(cfg["noise_length_sec"]))
+    dummy = np.zeros((win_len,), dtype=np.float32)
+    X, _info = make_model_input_from_audio_window(dummy, cfg)  # (T,D,1)
+    input_shape = tuple(X.shape)
+
+    model = build_model_transformer_time(input_shape=input_shape, cfg=cfg)
+
+    kind, _diag = keras_artifact_kind(model_path)
+    if kind == "keras_zip":
+        with tempfile.TemporaryDirectory() as td:
+            weights_path = _extract_weights_path_from_keras_zip(model_path, td)
+            model.load_weights(weights_path)
+        return model
+
+    if kind == "hdf5":
+        # HDF5 file contains weights groups
+        model.load_weights(model_path)
+        return model
+
+    # savedmodel_dir is unlikely in your setup for ".keras", but keep a clear error
+    raise RuntimeError(f"Unsupported artifact kind for weights-only load: {kind}")
+
+
+# =========================================================
+# Robust loader (normal load_model first; fallback for transformer unsupported callable)
+# =========================================================
+def _enable_unsafe_deser_if_available():
+    if not HAS_KERAS:
+        return
+    try:
+        if hasattr(keras, "config") and hasattr(keras.config, "enable_unsafe_deserialization"):
+            keras.config.enable_unsafe_deserialization()
+    except Exception:
+        pass
+
+
+def _get_tfoplambda_class():
+    if HAS_KERAS:
+        cls = getattr(keras.layers, "TFOpLambda", None)
+        if cls is not None:
+            return cls
+        try:
+            from keras.src.layers.core.tf_op_layer import TFOpLambda as K3TFOpLambda  # type: ignore
+            return K3TFOpLambda
+        except Exception:
+            pass
+        try:
+            from keras.layers.core.tf_op_layer import TFOpLambda as K2TFOpLambda  # type: ignore
+            return K2TFOpLambda
+        except Exception:
+            pass
+    cls = getattr(tf.keras.layers, "TFOpLambda", None)
+    return cls
+
+
+def _load_model_with_tfoplambda(path: str):
+    tfop = _get_tfoplambda_class()
+    if HAS_KERAS:
+        lambda_layer = keras.layers.Lambda
+        scope_ctx = keras.utils.custom_object_scope
+    else:
+        lambda_layer = tf.keras.layers.Lambda
+        scope_ctx = tf.keras.utils.custom_object_scope
+
+    custom_objects = {"TFOpLambda": (tfop if tfop is not None else lambda_layer)}
+
+    # Prefer standalone keras loader (Keras 3)
+    if HAS_KERAS:
+        _enable_unsafe_deser_if_available()
+        load_fn = getattr(getattr(keras, "saving", None), "load_model", None) or keras.models.load_model
+        try:
+            with scope_ctx(custom_objects):
+                return load_fn(path, compile=False, custom_objects=custom_objects, safe_mode=False)
+        except TypeError:
+            with scope_ctx(custom_objects):
+                return load_fn(path, compile=False, custom_objects=custom_objects)
+
+    # Fallback tf.keras
+    with tf.keras.utils.custom_object_scope(custom_objects):
+        return tf.keras.models.load_model(path, compile=False, custom_objects=custom_objects)
+
+
+# =========================================================
+# Inference
+# =========================================================
 def model_predict_frames(model, X_t_d_1: np.ndarray, cfg: dict) -> np.ndarray:
     train_unit = str(cfg.get("train_unit", "frame")).lower()
 
@@ -636,7 +714,7 @@ def discover_models(selected_models_dir: str) -> Tuple[List[str], List[Tuple[str
 
 
 # =========================================================
-# Streamlit caching: robust model loader + cfg
+# Streamlit caching: model loader + cfg
 # =========================================================
 @st.cache_resource(show_spinner=False)
 def load_model_and_cfg(model_path: str):
@@ -662,22 +740,19 @@ def load_model_and_cfg(model_path: str):
             f"Model '{os.path.basename(model_path)}' requires librosa (feature_type={ft}), but librosa is not installed."
         )
 
-    # HDF5 masquerading as .keras -> load via temp .h5 (forces proper backend)
-    if kind == "hdf5":
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
-            tmp_path = tmp.name
-        try:
-            shutil.copyfile(model_path, tmp_path)
-            model = _load_model_with_tfoplambda_fallbacks(tmp_path)
-        finally:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+    # If HDF5 masquerading as .keras, still OK: detect kind="hdf5" and handle in loader
+    try:
+        model = _load_model_with_tfoplambda(model_path)
         return model, cfg
+    except Exception as e:
+        msg = str(e)
 
-    model = _load_model_with_tfoplambda_fallbacks(model_path)
-    return model, cfg
+        # Key fallback: transformer_time sometimes can't be deserialized ("unsupported callable")
+        if cfg.get("model_type", "").lower() == "transformer_time" and ("unsupported callable" in msg.lower()):
+            model = rebuild_and_load_transformer_weights(model_path, cfg)
+            return model, cfg
+
+        raise
 
 
 @st.cache_data(show_spinner=False)
@@ -835,3 +910,18 @@ for up in uploads:
         ylabel="Flow",
         colors=colors,
     )
+
+    with st.expander("Model details (cfg summary)"):
+        rows = []
+        for model_name, (_model, cfg, model_path) in models_cfgs.items():
+            rows.append({
+                "model": model_name,
+                "model_path": model_path,
+                "train_unit": cfg.get("train_unit"),
+                "feature_type": cfg.get("feature_type"),
+                "transform": cfg.get("transformation_method"),
+                "sample_rate": cfg.get("sample_rate"),
+                "noise_length_sec": cfg.get("noise_length_sec"),
+                "frame_length_sec": cfg.get("frame_length_sec"),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
