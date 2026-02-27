@@ -21,7 +21,10 @@ except ImportError:
 ARCH_GROUP = "transformer"
 MODEL_TYPES = {"transformer_time"}
 KNOWN_FEATURE_TYPES = {"raw", "td_spec_stats", "logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas"}
+
+ZIP_MAGIC = b"PK\x03\x04"
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+LFS_MAGIC = b"version https://git-lfs.github.com/spec/v1"
 
 
 # -------------------------
@@ -111,19 +114,62 @@ def build_effective_cfg(model_path: str) -> dict:
     }
     cfg_path = find_nearby_config_json(model_path)
     if cfg_path is not None:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
     cfg.update(parse_model_filename(model_path))
     return cfg
 
 
-def is_hdf5_file(path: str) -> bool:
+# -------------------------
+# Diagnostics (temporary but useful)
+# -------------------------
+def _read_head(path: str, n: int = 256) -> bytes:
     try:
         with open(path, "rb") as f:
-            head = f.read(len(HDF5_MAGIC))
-        return head == HDF5_MAGIC
+            return f.read(n)
     except Exception:
-        return False
+        return b""
+
+
+def diagnose_model_file(path: str) -> Dict[str, str]:
+    info: Dict[str, str] = {}
+    info["path"] = os.path.abspath(path)
+
+    try:
+        st = os.stat(path)
+        info["size_bytes"] = str(st.st_size)
+    except Exception as e:
+        info["size_bytes"] = f"stat_failed: {e}"
+
+    head = _read_head(path, 256)
+    info["head_hex_32"] = head[:32].hex() if head else "read_failed"
+    info["looks_like_zip"] = "yes" if head.startswith(ZIP_MAGIC) or zipfile.is_zipfile(path) else "no"
+    info["looks_like_hdf5"] = "yes" if head.startswith(HDF5_MAGIC) else "no"
+    info["looks_like_git_lfs_pointer"] = "yes" if head.startswith(LFS_MAGIC) else "no"
+
+    if info["looks_like_git_lfs_pointer"] == "yes":
+        # show first few lines
+        try:
+            txt = head.decode("utf-8", errors="ignore")
+            info["lfs_preview"] = "\\n".join(txt.splitlines()[:5])
+        except Exception:
+            info["lfs_preview"] = "decode_failed"
+
+    # pydub/ffmpeg diag
+    info["pydub_ffmpeg"] = str(getattr(AudioSegment, "converter", "unknown"))
+
+    # TF/Keras diag
+    info["tf_version"] = getattr(tf, "__version__", "unknown")
+    try:
+        import keras  # noqa
+        info["keras_version"] = getattr(keras, "__version__", "unknown")
+    except Exception:
+        info["keras_version"] = "not_installed"
+
+    return info
 
 
 # -------------------------
@@ -132,7 +178,7 @@ def is_hdf5_file(path: str) -> bool:
 def _transformer_encoder_block(x, num_heads, d_model, ff_dim, dropout):
     attn = tf.keras.layers.MultiHeadAttention(
         num_heads=num_heads,
-        key_dim=d_model // max(1, num_heads)
+        key_dim=d_model // max(1, num_heads),
     )(x, x)
     attn = tf.keras.layers.Dropout(dropout)(attn)
     x = tf.keras.layers.LayerNormalization(epsilon=1e-6)(x + attn)
@@ -173,147 +219,154 @@ def build_model_transformer_time(input_shape: Tuple[int, int, int], cfg: dict) -
 
 
 # -------------------------
-# .keras zip helpers
+# Load helpers
 # -------------------------
+def _try_load_direct_any_format(model_path: str):
+    """
+    1) If file is HDF5 (even with .keras ext) -> load as H5
+    2) Else attempt tf.keras load_model (zip .keras)
+    """
+    head = _read_head(model_path, 16)
+    custom_objects = {"TFOpLambda": tf.keras.layers.Lambda, "SlicingOpLambda": tf.keras.layers.Lambda}
+
+    # HDF5 disguised as .keras
+    if head.startswith(HDF5_MAGIC):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
+            tmp_path = tmp.name
+        try:
+            shutil.copyfile(model_path, tmp_path)
+            with tf.keras.utils.custom_object_scope(custom_objects):
+                return tf.keras.models.load_model(tmp_path, compile=False)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    # normal .keras zip
+    with tf.keras.utils.custom_object_scope(custom_objects):
+        return tf.keras.models.load_model(model_path, compile=False)
+
+
 def _read_keras_zip_json(model_path: str) -> dict:
-    """
-    Read model config JSON directly from .keras zip without deserializing the model.
-    """
     with zipfile.ZipFile(model_path, "r") as z:
-        # Keras 3 usually has "config.json"
         if "config.json" in z.namelist():
-            data = z.read("config.json")
-            return json.loads(data.decode("utf-8"))
-        # older variants
-        for name in z.namelist():
-            if name.endswith(".json"):
+            return json.loads(z.read("config.json").decode("utf-8"))
+        # fallback: first json
+        for n in z.namelist():
+            if n.endswith(".json"):
                 try:
-                    data = z.read(name)
-                    return json.loads(data.decode("utf-8"))
+                    return json.loads(z.read(n).decode("utf-8"))
                 except Exception:
-                    pass
+                    continue
     raise ValueError("No JSON config found inside .keras archive")
 
 
-def _extract_keras_weights_to_temp(model_path: str) -> str:
+def _infer_input_shape_from_config_json(cfg_json: dict) -> Optional[Tuple[int, int, int]]:
+    root = cfg_json
+    if isinstance(root, dict) and "model_config" in root:
+        root = root["model_config"]
+
+    # common shapes:
+    # {"config": {"layers": [...]}}
+    if isinstance(root, dict) and "config" in root and isinstance(root["config"], dict) and "layers" in root["config"]:
+        mc = root["config"]
+    elif isinstance(root, dict) and "layers" in root:
+        mc = root
+    else:
+        return None
+
+    layers = mc.get("layers", [])
+    for layer in layers:
+        if layer.get("class_name") == "InputLayer":
+            conf = layer.get("config", {})
+            batch_shape = conf.get("batch_shape") or conf.get("batch_input_shape") or conf.get("input_shape")
+            if isinstance(batch_shape, (list, tuple)) and len(batch_shape) == 4:
+                return (int(batch_shape[1]), int(batch_shape[2]), int(batch_shape[3]))
+    return None
+
+
+def _extract_weights_from_zip(model_path: str) -> Tuple[str, str]:
     """
-    Extract weights file from .keras zip to a temp folder and return path to weights file.
+    returns (weights_path, tmp_root_dir)
     """
-    tmp_dir = tempfile.mkdtemp(prefix="keras_weights_")
+    tmp_root = tempfile.mkdtemp(prefix="keras_zip_")
     with zipfile.ZipFile(model_path, "r") as z:
-        # Keras 3: "model.weights.h5"
+        # Prefer Keras3 weights file
         cand = None
         for n in z.namelist():
             if n.endswith("model.weights.h5") or n.endswith(".weights.h5"):
                 cand = n
                 break
         if cand is None:
-            # fallback: any .h5 inside archive
             for n in z.namelist():
                 if n.endswith(".h5"):
                     cand = n
                     break
         if cand is None:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise ValueError("No weights .h5 found inside .keras archive")
-
-        z.extract(cand, tmp_dir)
-        return os.path.join(tmp_dir, cand)
-
-
-def _infer_input_shape_from_config_json(cfg_json: dict) -> Optional[Tuple[int, int, int]]:
-    """
-    Try to infer model input shape (T, D, 1) from JSON config.
-    We do NOT load the model, we just parse the JSON.
-    """
-    # Keras 3 format: {"model_config": {...}} or {"config": {...}}
-    root = cfg_json
-    if "model_config" in root:
-        root = root["model_config"]
-    if "config" in root and isinstance(root["config"], dict) and "layers" in root["config"]:
-        mc = root["config"]
-    elif "layers" in root:
-        mc = root
-    else:
-        return None
-
-    layers = mc.get("layers", [])
-    # Find InputLayer
-    for layer in layers:
-        if layer.get("class_name") == "InputLayer":
-            conf = layer.get("config", {})
-            batch_shape = conf.get("batch_shape") or conf.get("batch_input_shape") or conf.get("input_shape")
-            if batch_shape is None:
-                continue
-            # batch_shape like [None, T, D, 1] or (None, T, D, 1)
-            if isinstance(batch_shape, (list, tuple)) and len(batch_shape) == 4:
-                T = int(batch_shape[1])
-                D = int(batch_shape[2])
-                C = int(batch_shape[3])
-                return (T, D, C)
-    return None
-
-
-def _try_load_direct(model_path: str):
-    """
-    Try normal load paths (may fail for transformer due to callable).
-    """
-    # keep minimal custom objects; may help older TF graphs
-    custom_objects = {"TFOpLambda": tf.keras.layers.Lambda, "SlicingOpLambda": tf.keras.layers.Lambda}
-    with tf.keras.utils.custom_object_scope(custom_objects):
-        return tf.keras.models.load_model(model_path, compile=False)
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            raise ValueError("No weights .h5 found inside .keras zip")
+        z.extract(cand, tmp_root)
+        return os.path.join(tmp_root, cand), tmp_root
 
 
 def load_model_and_cfg(model_path: str):
     cfg = build_effective_cfg(model_path)
+
+    # feature availability
     ft = str(cfg.get("feature_type", "raw")).lower()
     if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(f"Model requires librosa (feature_type={ft}), but librosa is not installed")
 
-    # 1) Fast path: try direct load (works for some envs)
+    diag = diagnose_model_file(model_path)
+
+    # If git-lfs pointer -> fail with clear message
+    if diag.get("looks_like_git_lfs_pointer") == "yes":
+        raise RuntimeError(
+            "Model file is a Git LFS pointer, not the actual binary weights.\n"
+            "You need to fetch LFS files when deploying (git lfs pull) "
+            "or upload real binaries to the repo.\n"
+            f"Diagnostics: {diag}"
+        )
+
+    # 1) Try direct load (supports zip .keras or HDF5 disguised)
     try:
-        model = _try_load_direct(model_path)
+        model = _try_load_direct_any_format(model_path)
         return model, cfg
     except Exception as e1:
-        # 2) Robust path: weights-only load
-        try:
-            if not zipfile.is_zipfile(model_path):
-                raise RuntimeError(f"Expected .keras zip, got non-zip file: {model_path}")
+        # 2) weights-only load ONLY if it's a real zip .keras
+        if not zipfile.is_zipfile(model_path):
+            raise RuntimeError(
+                "Failed to load transformer model.\n"
+                f"Direct load error: {type(e1).__name__}: {e1}\n"
+                "Weights-only load skipped because file is not a valid .keras zip.\n"
+                f"Diagnostics: {diag}"
+            ) from e1
 
+        # weights-only path
+        try:
             cfg_json = _read_keras_zip_json(model_path)
             in_shape = _infer_input_shape_from_config_json(cfg_json)
             if in_shape is None:
-                raise RuntimeError("Could not infer input_shape from .keras JSON config")
-
-            # rebuild architecture
-            if str(cfg.get("model_type", "")).lower() != "transformer_time":
-                raise RuntimeError(f"Unexpected model_type for this loader: {cfg.get('model_type')}")
+                raise RuntimeError("Could not infer input_shape from .keras config.json")
 
             model = build_model_transformer_time(in_shape, cfg)
             model.build((None,) + tuple(in_shape))
 
-            # extract and load weights
-            wpath = _extract_keras_weights_to_temp(model_path)
+            wpath, tmp_root = _extract_weights_from_zip(model_path)
             try:
                 model.load_weights(wpath)
             finally:
-                # cleanup temp dir that contains weights
-                tmp_dir = os.path.dirname(os.path.dirname(wpath)) if os.path.basename(os.path.dirname(wpath)) != "" else os.path.dirname(wpath)
-                # safer cleanup: remove root temp folder created by mkdtemp prefix
-                # (we stored it as the first folder in path)
-                # wpath is like /tmp/keras_weights_xxx/<inside_zip_path>/model.weights.h5
-                root_tmp = wpath.split(os.sep)
-                # simple + safe: remove the mkdtemp folder by walking up until prefix matches
-                # but easiest: just remove mkdtemp itself
-                # It is the first component after /tmp... we stored in mkdtemp, so:
-                shutil.rmtree(os.path.dirname(wpath).split(os.sep)[0] if False else os.path.dirname(wpath), ignore_errors=True)
+                shutil.rmtree(tmp_root, ignore_errors=True)
+
             return model, cfg
 
         except Exception as e2:
             raise RuntimeError(
-                f"Failed to load transformer model.\n"
+                "Failed to load transformer model.\n"
                 f"Direct load error: {type(e1).__name__}: {e1}\n"
-                f"Weights-only load error: {type(e2).__name__}: {e2}"
+                f"Weights-only load error: {type(e2).__name__}: {e2}\n"
+                f"Diagnostics: {diag}"
             ) from e2
 
 
@@ -525,9 +578,6 @@ def rolling_mean_5(x: np.ndarray) -> np.ndarray:
     return pd.Series(x).rolling(window=5, min_periods=1, center=True).mean().to_numpy(dtype=np.float32)
 
 
-# -------------------------
-# Inference
-# -------------------------
 def predict_audio_bytes(model, cfg: dict, audio_bytes: bytes, suffix: str, hop_sec: Optional[float]) -> pd.DataFrame:
     sr = int(cfg.get("sample_rate", 44100))
     audio = load_audio_mono_from_bytes(audio_bytes, suffix, sr)
