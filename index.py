@@ -1,9 +1,8 @@
+# index.py
 import os
 import io
-import re
 import json
 import glob
-import math
 import tempfile
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -13,7 +12,6 @@ import streamlit as st
 
 import tensorflow as tf
 from pydub import AudioSegment
-
 import matplotlib.pyplot as plt
 
 # Optional librosa
@@ -28,8 +26,12 @@ SUPPORTED_EXTENSIONS = (".wav", ".m4a", ".mp3", ".flac", ".ogg")
 WINDOW_MODELS = {"cnn2d_resnet", "crnn", "tcn_time", "transformer_time", "dual_branch_time"}
 FRAME_MODELS  = {"basic", "cnn_lstm", "tcn", "multitask", "roo_tflite"}
 
+# Absolute paths relative to THIS file (fixes Streamlit cwd issues)
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
+
 # -------------------------
-# Core audio + feature utils (совместимо с train)
+# Audio utils
 # -------------------------
 def load_audio_mono_from_path(path: str, sr: int) -> np.ndarray:
     seg = AudioSegment.from_file(path)
@@ -77,6 +79,9 @@ def normalize_feature_matrix(X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     sd = float(X.std())
     return ((X - mu) / sd).astype(np.float32) if sd > eps else (X - mu).astype(np.float32)
 
+# -------------------------
+# Feature extraction (as in training)
+# -------------------------
 def extract_logmel(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     if not HAS_LIBROSA:
         raise RuntimeError("librosa required for logmel features")
@@ -130,6 +135,7 @@ def extract_mfcc_deltas(audio: np.ndarray, sr: int, cfg: dict) -> np.ndarray:
     X = np.concatenate([M, d1, d2], axis=0)
     return X.T.astype(np.float32)
 
+# td_spec_stats (as in training)
 def _zcr(frame: np.ndarray) -> float:
     if frame.size <= 1:
         return 0.0
@@ -234,6 +240,9 @@ def extract_features_from_waveform(audio: np.ndarray, sr: int, cfg: dict) -> Tup
 
     raise ValueError(f"Unsupported feature_type: {ftype}")
 
+# -------------------------
+# Model filename parsing + cfg
+# -------------------------
 def infer_train_unit_for_model(model_type: str) -> str:
     mt = str(model_type).lower()
     return "window" if mt in WINDOW_MODELS else "frame"
@@ -244,10 +253,7 @@ def parse_model_filename(model_path: str) -> Dict[str, Optional[str]]:
         base = base[:-6]
     parts = base.split("_")
     if len(parts) < 4:
-        raise ValueError(
-            f"Can't parse model filename '{os.path.basename(model_path)}'. "
-            f"Expected arch_feat_transform_loss.keras"
-        )
+        raise ValueError(f"Can't parse model filename '{os.path.basename(model_path)}' (expected arch_feat_transform_loss.keras)")
     arch = parts[0].lower()
     feat = parts[1].lower()
     transform = parts[2]
@@ -303,7 +309,6 @@ def build_effective_cfg(model_path: str) -> dict:
     cfg["transformation_method"] = info["transformation_method"]
     cfg["loss_type"] = info["loss_type"]
     cfg["train_unit"] = infer_train_unit_for_model(cfg["model_type"])
-
     return cfg
 
 def pad_or_trim_1d(x: np.ndarray, target_len: int) -> np.ndarray:
@@ -319,7 +324,6 @@ def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tupl
     win_len = int(sr * float(cfg["noise_length_sec"]))
 
     audio_win = pad_or_trim_1d(audio_win, win_len)
-
     mixed = transform_audio(audio_win, cfg.get("transformation_method", None))
 
     ftype = str(cfg.get("feature_type", "raw")).lower()
@@ -342,8 +346,6 @@ def make_model_input_from_audio_window(audio_win: np.ndarray, cfg: dict) -> Tupl
     info = {
         "hop_in_samples": int(hop_in_samples),
         "sr": sr,
-        "feature_type": ftype,
-        "win_len_samples": win_len,
         "frames_per_window": int(X.shape[0]),
         "feature_dim": int(X.shape[1]) if X.shape[0] > 0 else 0,
     }
@@ -373,11 +375,9 @@ def model_predict_frames(model: tf.keras.Model, X_t_d_1: np.ndarray, cfg: dict) 
     raise ValueError(f"Unsupported train_unit: {train_unit}")
 
 def rolling_mean_5(x: np.ndarray) -> np.ndarray:
-    # сглаживание по 5 точкам: centered rolling mean
     if x.size == 0:
         return x
-    s = pd.Series(x)
-    return s.rolling(window=5, min_periods=1, center=True).mean().to_numpy(dtype=np.float32)
+    return pd.Series(x).rolling(window=5, min_periods=1, center=True).mean().to_numpy(dtype=np.float32)
 
 def predict_audio_bytes_for_model(
     model: tf.keras.Model,
@@ -386,10 +386,6 @@ def predict_audio_bytes_for_model(
     audio_suffix: str,
     window_hop_sec: Optional[float],
 ) -> pd.DataFrame:
-    """
-    Предсказываем для одного аудиофайла (bytes) и одной модели.
-    Возвращаем per-frame DataFrame: time_sec, dose_pred, flow_pred.
-    """
     sr = int(cfg["sample_rate"])
     win_sec = float(cfg["noise_length_sec"])
     hop_sec = win_sec if window_hop_sec is None else float(window_hop_sec)
@@ -397,7 +393,6 @@ def predict_audio_bytes_for_model(
     win_len = int(sr * win_sec)
     hop_len = max(1, int(sr * hop_sec))
 
-    # pydub проще кормить файлом
     with tempfile.NamedTemporaryFile(delete=True, suffix=audio_suffix) as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
@@ -411,13 +406,13 @@ def predict_audio_bytes_for_model(
         end = start + win_len
         if start >= n and n > 0:
             break
+
         chunk = audio[start:end]
         X, info = make_model_input_from_audio_window(chunk, cfg)
         pred = model_predict_frames(model, X, cfg)  # (T,2)
 
-        T = pred.shape[0]
         hop_samples = max(1, int(info["hop_in_samples"]))
-        for i in range(T):
+        for i in range(pred.shape[0]):
             t_s = (start + i * hop_samples) / sr
             rows.append({
                 "time_sec": float(t_s),
@@ -438,12 +433,34 @@ def predict_audio_bytes_for_model(
     return df
 
 # -------------------------
+# Model discovery (absolute paths)
+# -------------------------
+def discover_models(selected_models_dir: str) -> List[str]:
+    pattern = os.path.join(os.path.abspath(selected_models_dir), "**", "*.keras")
+    paths = sorted(glob.glob(pattern, recursive=True))
+    return [os.path.abspath(p) for p in paths]
+
+# -------------------------
 # Streamlit caching
 # -------------------------
 @st.cache_resource(show_spinner=False)
 def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
-    cfg = build_effective_cfg(model_path)
+    model_path = os.path.abspath(model_path)
 
+    # Helpful pointer check (Git LFS)
+    try:
+        if os.path.getsize(model_path) < 1024:
+            with open(model_path, "rb") as f:
+                head = f.read(200)
+            if b"git-lfs" in head or b"version https://git-lfs.github.com/spec" in head:
+                raise RuntimeError(
+                    f"'{os.path.basename(model_path)}' looks like a Git LFS pointer. "
+                    f"Ensure LFS files are fetched on the runtime."
+                )
+    except OSError:
+        pass
+
+    cfg = build_effective_cfg(model_path)
     ft = str(cfg.get("feature_type", "raw")).lower()
     if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(
@@ -455,23 +472,12 @@ def load_model_and_cfg(model_path: str) -> Tuple[tf.keras.Model, dict]:
 
 @st.cache_data(show_spinner=False)
 def waveform_for_display(audio_bytes: bytes, suffix: str, display_sr: int = 44100) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Возвращает (t_sec, waveform) для отображения.
-    """
     with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
         tmp.write(audio_bytes)
         tmp.flush()
         x = load_audio_mono_from_path(tmp.name, display_sr)
     t = np.arange(len(x), dtype=np.float32) / float(display_sr)
     return t, x
-
-# -------------------------
-# Model discovery
-# -------------------------
-def discover_models(selected_models_dir: str) -> List[str]:
-    # рекурсивно, чтобы можно было хранить по подпапкам
-    paths = sorted(glob.glob(os.path.join(selected_models_dir, "**", "*.keras"), recursive=True))
-    return paths
 
 # -------------------------
 # Plot helpers
@@ -498,8 +504,12 @@ def plot_predictions_overlay(
     for model_name, df in dfs_by_model.items():
         if df is None or df.empty:
             continue
-        ax.plot(df["time_sec"].to_numpy(), df[y_col].to_numpy(),
-                label=model_name, color=colors.get(model_name, None))
+        ax.plot(
+            df["time_sec"].to_numpy(),
+            df[y_col].to_numpy(),
+            label=model_name,
+            color=colors.get(model_name, None),
+        )
     ax.set_title(title)
     ax.set_xlabel("Time, sec")
     ax.set_ylabel(ylabel)
@@ -508,38 +518,35 @@ def plot_predictions_overlay(
     st.pyplot(fig, clear_figure=True)
 
 # -------------------------
-# App UI
+# App
 # -------------------------
 st.set_page_config(page_title="Inhale inference", layout="wide")
-
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
-selected_models_dir = "selected_models"
-model_paths = discover_models(selected_models_dir)
+model_paths = discover_models(SELECTED_MODELS_DIR)
 
 if not model_paths:
-    st.error(f"No .keras models found in '{selected_models_dir}/'. Add models there and restart.")
+    st.error(f"No .keras models found in '{SELECTED_MODELS_DIR}'. Put models under selected_models/ and restart.")
     st.stop()
 
-model_labels = {p: os.path.relpath(p, selected_models_dir) for p in model_paths}
+model_labels = {p: os.path.relpath(p, SELECTED_MODELS_DIR) for p in model_paths}
 
 with st.sidebar:
     st.header("Models")
     chosen = st.multiselect(
         "Select up to 3 models",
         options=model_paths,
-        format_func=lambda p: model_labels[p],
+        format_func=lambda p: model_labels.get(p, os.path.basename(p)),
         default=[],
         max_selections=3,
     )
 
     st.header("Windowing")
     hop_sec = st.number_input(
-        "Window hop (sec). If empty-like use default = window length",
+        "Window hop (sec). Used only if 'Use hop = noise_length_sec' is OFF",
         min_value=0.1,
         value=5.0,
         step=0.1,
-        help="Prediction is done on windows of noise_length_sec (from config/model). Hop controls overlap."
     )
     use_default_hop = st.checkbox("Use hop = noise_length_sec (per model)", value=True)
 
@@ -550,6 +557,13 @@ with st.sidebar:
         accept_multiple_files=True,
     )
 
+    st.divider()
+    if st.checkbox("Debug paths", value=False):
+        st.write("APP_DIR:", APP_DIR)
+        st.write("SELECTED_MODELS_DIR:", SELECTED_MODELS_DIR)
+        st.write("Found models:", len(model_paths))
+        st.write(model_paths[:20])
+
 if not chosen:
     st.info("Select 1–3 models in the sidebar.")
     st.stop()
@@ -558,12 +572,12 @@ if not uploads:
     st.info("Upload one or more audio files in the sidebar.")
     st.stop()
 
-# colors: stable palette (matplotlib default cycle)
+# Colors: matplotlib default cycle
 palette = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3", "C4"])
 chosen_names = [model_labels[p] for p in chosen]
 colors = {chosen_names[i]: palette[i % len(palette)] for i in range(len(chosen_names))}
 
-# load models
+# Load models
 models_cfgs = {}
 load_errors = []
 for p in chosen:
@@ -578,7 +592,7 @@ if load_errors:
     st.error("Some models failed to load:\n\n" + "\n".join(load_errors))
     st.stop()
 
-# processing
+# Process each uploaded audio file
 for up in uploads:
     audio_name = up.name
     suffix = os.path.splitext(audio_name)[1].lower()
@@ -586,18 +600,16 @@ for up in uploads:
 
     st.markdown(f"## {audio_name}")
 
-    # waveform
+    # Waveform
     t, x = waveform_for_display(audio_bytes, suffix, display_sr=44100)
     plot_waveform(t, x, title=f"Waveform: {audio_name}")
 
-    # predictions for each model
+    # Predictions
     dfs_by_model = {}
 
     with st.spinner(f"Predicting for {audio_name} with {len(models_cfgs)} model(s)..."):
-        for model_name, (model, cfg, model_path) in models_cfgs.items():
-            # hop
+        for model_name, (model, cfg, _model_path) in models_cfgs.items():
             window_hop_sec = None if use_default_hop else float(hop_sec)
-
             df_pred = predict_audio_bytes_for_model(
                 model=model,
                 cfg=cfg,
@@ -607,7 +619,6 @@ for up in uploads:
             )
             dfs_by_model[model_name] = df_pred
 
-    # plots dose + flow (smooth)
     plot_predictions_overlay(
         dfs_by_model=dfs_by_model,
         y_col="dose_smooth",
@@ -624,10 +635,9 @@ for up in uploads:
         colors=colors,
     )
 
-    # optional: show small table with model cfg key params
     with st.expander("Model details (cfg summary)"):
         rows = []
-        for model_name, (_, cfg, model_path) in models_cfgs.items():
+        for model_name, (_model, cfg, model_path) in models_cfgs.items():
             rows.append({
                 "model": model_name,
                 "model_path": model_path,
