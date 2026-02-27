@@ -11,13 +11,10 @@ import pandas as pd
 from pydub import AudioSegment
 
 import tensorflow as tf
-
-# ---- IMPORTANT: "warm up" layer imports so deserializer sees them ----
-# In some Keras 3 / TF-Keras setups, standard RNN layers may not be found unless imported.
-from tensorflow.keras import layers as _layers  # noqa: F401
+from tensorflow.keras import layers as _layers  # прогрев импорта слоёв
 
 try:
-    import keras as _keras  # noqa: F401
+    import keras as _keras
 except Exception:
     _keras = None
 
@@ -31,6 +28,31 @@ ARCH_GROUP = "cnn"
 MODEL_TYPES = {"cnn_lstm", "cnn2d_resnet", "crnn"}
 KNOWN_FEATURE_TYPES = {"raw", "td_spec_stats", "logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas"}
 HDF5_MAGIC = b"\x89HDF\r\n\x1a\n"
+
+
+# =========================
+# Keras compatibility wrappers
+# =========================
+@tf.keras.utils.register_keras_serializable(package="compat")
+class CompatLSTM(tf.keras.layers.LSTM):
+    """Drop legacy/unsupported config keys (e.g., time_major) during deserialization."""
+    @classmethod
+    def from_config(cls, config):
+        config = dict(config) if config is not None else {}
+        config.pop("time_major", None)  # <-- main fix
+        # These sometimes appear in older exports; safe to ignore if present
+        config.pop("implementation", None) if config.get("implementation", None) not in (1, 2) else None
+        return cls(**config)
+
+
+@tf.keras.utils.register_keras_serializable(package="compat")
+class CompatGRU(tf.keras.layers.GRU):
+    @classmethod
+    def from_config(cls, config):
+        config = dict(config) if config is not None else {}
+        config.pop("time_major", None)
+        config.pop("implementation", None) if config.get("implementation", None) not in (1, 2) else None
+        return cls(**config)
 
 
 def list_models(selected_models_dir: str) -> List[str]:
@@ -129,16 +151,18 @@ def is_hdf5_file(path: str) -> bool:
 
 def _cnn_custom_objects() -> dict:
     """
-    Provide explicit mappings for common layers so Keras deserializer
-    never fails with 'Could not locate class LSTM' in some environments.
+    Provide explicit mappings for layers to fix:
+      - missing layer class resolution
+      - legacy config keys like time_major (via CompatLSTM/CompatGRU)
     """
-    co = {
-        # RNNs
-        "LSTM": tf.keras.layers.LSTM,
-        "GRU": tf.keras.layers.GRU,
+    return {
+        # RNNs (patched)
+        "LSTM": CompatLSTM,
+        "GRU": CompatGRU,
         "SimpleRNN": tf.keras.layers.SimpleRNN,
         "Bidirectional": tf.keras.layers.Bidirectional,
-        # common layers used in these models
+
+        # common
         "Conv1D": tf.keras.layers.Conv1D,
         "Conv2D": tf.keras.layers.Conv2D,
         "Dense": tf.keras.layers.Dense,
@@ -157,7 +181,6 @@ def _cnn_custom_objects() -> dict:
         "LayerNormalization": tf.keras.layers.LayerNormalization,
         "Embedding": tf.keras.layers.Embedding,
     }
-    return co
 
 
 def load_model_and_cfg(model_path: str):
@@ -169,12 +192,8 @@ def load_model_and_cfg(model_path: str):
     custom_objects = _cnn_custom_objects()
 
     def _load(path: str):
-        # Keras 3 sometimes needs safe_mode=False for older artifacts
-        try:
-            return tf.keras.models.load_model(path, compile=False, custom_objects=custom_objects)
-        except TypeError:
-            # older TF might not accept custom_objects kw in some combos (rare)
-            return tf.keras.models.load_model(path, compile=False)
+        # TF loader (most cases)
+        return tf.keras.models.load_model(path, compile=False, custom_objects=custom_objects)
 
     # allow HDF5 disguised as .keras
     if (not zipfile.is_zipfile(model_path)) and is_hdf5_file(model_path):
@@ -193,19 +212,21 @@ def load_model_and_cfg(model_path: str):
     try:
         model = _load(model_path)
         return model, cfg
-    except Exception as e:
-        # Final fallback for Keras 3 deserialization edge-cases
+    except Exception:
+        # Final fallback for Keras 3 edge cases
         if _keras is not None:
-            try:
-                model = _keras.saving.load_model(model_path, compile=False, custom_objects=custom_objects, safe_mode=False)
-                return model, cfg
-            except Exception:
-                pass
-        raise e
+            model = _keras.saving.load_model(
+                model_path,
+                compile=False,
+                custom_objects=custom_objects,
+                safe_mode=False,
+            )
+            return model, cfg
+        raise
 
 
 # ==============================
-# Audio + preprocessing (as before)
+# Audio + preprocessing (unchanged)
 # ==============================
 def load_audio_mono_from_bytes(audio_bytes: bytes, suffix: str, sr: int) -> np.ndarray:
     with tempfile.NamedTemporaryFile(delete=True, suffix=suffix) as tmp:
@@ -429,7 +450,7 @@ def _predict_window(model, cfg: dict, audio: np.ndarray, sr: int, hop_sec: Optio
             X2d = normalize_feature_matrix(X2d)
 
         X2d = pad_or_trim_2d(X2d, target_T, target_D)
-        X = X2d[..., None].astype(np.float32)  # (T,D,1)
+        X = X2d[..., None].astype(np.float32)
 
         pred = model.predict(X[None, ...], verbose=0)
         if isinstance(pred, (list, tuple)):
@@ -437,7 +458,7 @@ def _predict_window(model, cfg: dict, audio: np.ndarray, sr: int, hop_sec: Optio
         pred = np.asarray(pred, dtype=np.float32)
         if pred.ndim != 3 or pred.shape[1] != target_T or pred.shape[2] != 2:
             raise ValueError(f"cnn(window): unexpected pred shape {pred.shape}")
-        pred = pred[0]  # (T,2)
+        pred = pred[0]
 
         hop_in_samples = max(1, int(hop_in_samples))
         for i in range(pred.shape[0]):
