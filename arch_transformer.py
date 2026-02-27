@@ -117,25 +117,43 @@ def is_hdf5_file(path: str) -> bool:
         return False
 
 
+def _get_safe_custom_objects():
+    """
+    Fix for deserialization errors like:
+      ValueError: Unknown layer: 'TFOpLambda'
+    Common when TF/Keras versions differ between training and inference env.
+    Mapping these to a plain Lambda is usually sufficient for inference.
+    """
+    return {
+        "TFOpLambda": tf.keras.layers.Lambda,
+        "SlicingOpLambda": tf.keras.layers.Lambda,
+    }
+
+
 def load_model_and_cfg(model_path: str):
     cfg = build_effective_cfg(model_path)
     ft = str(cfg.get("feature_type", "raw")).lower()
     if ft in ("logmel", "pcen_mel", "spectrogram", "mfcc", "mfcc_deltas") and not HAS_LIBROSA:
         raise RuntimeError(f"Model requires librosa (feature_type={ft}), but librosa is not installed")
 
+    custom_objects = _get_safe_custom_objects()
+
+    # allow HDF5 disguised as .keras
     if (not zipfile.is_zipfile(model_path)) and is_hdf5_file(model_path):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".h5") as tmp:
             tmp_path = tmp.name
         try:
             shutil.copyfile(model_path, tmp_path)
-            model = tf.keras.models.load_model(tmp_path, compile=False)
+            with tf.keras.utils.custom_object_scope(custom_objects):
+                model = tf.keras.models.load_model(tmp_path, compile=False)
         finally:
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
     else:
-        model = tf.keras.models.load_model(model_path, compile=False)
+        with tf.keras.utils.custom_object_scope(custom_objects):
+            model = tf.keras.models.load_model(model_path, compile=False)
 
     return model, cfg
 
@@ -256,7 +274,6 @@ def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict):
         else:
             out[i, 3] = 0.0
 
-        # basic spectral stats
         x = fr.astype(np.float32, copy=False)
         win = np.hanning(len(x)).astype(np.float32)
         xw = x * win
@@ -265,15 +282,15 @@ def extract_td_spec_stats(audio: np.ndarray, sr: int, cfg: dict):
         power = spec * spec
         ps = float(np.sum(power))
         if ps > 0:
-            out[i, 4] = float(np.sum(freqs * power) / ps)  # centroid
+            out[i, 4] = float(np.sum(freqs * power) / ps)
             gm = float(np.exp(np.mean(np.log(spec))))
             am = float(np.mean(spec))
-            out[i, 5] = float(gm / (am + 1e-12))  # flatness
+            out[i, 5] = float(gm / (am + 1e-12))
             c = np.cumsum(power)
             thr = 0.85 * c[-1]
             idx = int(np.searchsorted(c, thr))
             idx = max(0, min(idx, len(freqs) - 1))
-            out[i, 6] = float(freqs[idx])  # rolloff
+            out[i, 6] = float(freqs[idx])
         else:
             out[i, 4] = 0.0
             out[i, 5] = 0.0
@@ -370,7 +387,6 @@ def predict_audio_bytes(model, cfg: dict, audio_bytes: bytes, suffix: str, hop_s
         if str(cfg.get("feature_type", "raw")).lower() != "raw":
             X2d = normalize_feature_matrix(X2d)
 
-        # critical: fit (T,D) to model.input_shape
         X2d = pad_or_trim_2d(X2d, target_T, target_D)
         X = X2d[..., None].astype(np.float32)
 
