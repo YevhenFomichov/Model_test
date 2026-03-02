@@ -115,41 +115,24 @@ def load_waveform(audio_bytes: bytes, suffix: str, sr: int = 44100) -> Tuple[int
 
 
 def make_common_time_grid(sr: int, n_samples: int, max_points: int) -> np.ndarray:
-    """
-    Common time axis spanning full waveform duration.
-    We downsample to <= max_points for plotting.
-    """
     duration = n_samples / float(sr)
     if n_samples <= 1 or duration <= 0:
         return np.zeros((0,), dtype=np.float32)
-
     n = int(min(max_points, n_samples))
-    # linspace gives endpoints [0, duration)
     return np.linspace(0.0, duration, num=n, endpoint=False, dtype=np.float32)
 
 
 def downsample_waveform_to_grid(x: np.ndarray, sr: int, t_grid: np.ndarray) -> np.ndarray:
-    """
-    Interpolate waveform onto plotting grid.
-    """
     if t_grid.size == 0:
         return np.zeros((0,), dtype=np.float32)
-
-    # original time axis for waveform (in seconds)
     t0 = np.arange(len(x), dtype=np.float32) / float(sr)
     return np.interp(t_grid, t0, x.astype(np.float32), left=x[0], right=x[-1]).astype(np.float32)
 
 
 def interpolate_predictions_to_grid(df: pd.DataFrame, t_grid: np.ndarray, col: str) -> np.ndarray:
-    """
-    Interpolate prediction series onto t_grid.
-    Makes the visible length match waveform duration exactly.
-    Uses edge-hold extrapolation (left/right).
-    """
     if df is None or df.empty or t_grid.size == 0:
         return np.full((t_grid.size,), np.nan, dtype=np.float32)
 
-    # Ensure sorted
     d = df[["time_sec", col]].dropna().sort_values("time_sec")
     if d.empty:
         return np.full((t_grid.size,), np.nan, dtype=np.float32)
@@ -157,7 +140,6 @@ def interpolate_predictions_to_grid(df: pd.DataFrame, t_grid: np.ndarray, col: s
     t = d["time_sec"].to_numpy(dtype=np.float32)
     y = d[col].to_numpy(dtype=np.float32)
 
-    # clip to [0, duration] for safety
     duration = float(t_grid[-1]) if t_grid.size else 0.0
     mask = (t >= 0.0) & (t <= duration + 1e-6)
     if np.any(mask):
@@ -167,7 +149,6 @@ def interpolate_predictions_to_grid(df: pd.DataFrame, t_grid: np.ndarray, col: s
     if t.size == 0:
         return np.full((t_grid.size,), np.nan, dtype=np.float32)
 
-    # edge-hold extrapolation to full duration
     return np.interp(t_grid, t, y, left=y[0], right=y[-1]).astype(np.float32)
 
 
@@ -178,7 +159,6 @@ def plot_waveform_and_predictions(
     colors: Dict[str, str],
     title_prefix: str,
 ):
-    # Waveform
     fig = plt.figure()
     ax = fig.add_subplot(111)
     ax.plot(t_grid, x_grid)
@@ -188,7 +168,6 @@ def plot_waveform_and_predictions(
     ax.grid(True, alpha=0.3)
     st.pyplot(fig, clear_figure=True)
 
-    # Dose
     fig = plt.figure()
     ax = fig.add_subplot(111)
     for name, p in preds_by_model.items():
@@ -200,7 +179,6 @@ def plot_waveform_and_predictions(
     ax.legend(loc="upper right")
     st.pyplot(fig, clear_figure=True)
 
-    # Flow
     fig = plt.figure()
     ax = fig.add_subplot(111)
     for name, p in preds_by_model.items():
@@ -223,6 +201,21 @@ def load_one_model(model_path: str):
             model, cfg = mod.load_model_and_cfg(model_path)
             return arch_name, model, cfg
     raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
+
+
+def _guess_streamlit_audio_mime(suffix: str) -> str:
+    s = suffix.lower()
+    if s == ".wav":
+        return "audio/wav"
+    if s == ".mp3":
+        return "audio/mpeg"
+    if s == ".m4a":
+        return "audio/mp4"
+    if s == ".flac":
+        return "audio/flac"
+    if s == ".ogg":
+        return "audio/ogg"
+    return "audio/*"
 
 
 # -----------------------------
@@ -266,11 +259,9 @@ with st.sidebar:
                         old_dir = os.path.dirname(os.path.abspath(mp))
                         old_mp = mp
 
-                        # move model
                         new_mp = _safe_move(old_mp, dst_dir)
                         moved.append((_rel_to_app(old_mp), _rel_to_app(new_mp)))
 
-                        # move config (optional) — look in old location
                         if move_with_config:
                             cfg_old = _find_config_for_model(old_mp)
                             if cfg_old and os.path.exists(cfg_old) and os.path.dirname(cfg_old) == old_dir:
@@ -321,6 +312,10 @@ with st.sidebar:
         step=1000,
     )
 
+    st.header("Audio player")
+    show_player = st.checkbox("Show audio player for each uploaded file", value=True)
+    autoplay = st.checkbox("Autoplay (browser-dependent)", value=False)
+
     st.header("Upload audio")
     uploads = st.file_uploader(
         "Upload audio files (10+ is OK)",
@@ -340,7 +335,7 @@ chosen_names = [os.path.relpath(p, SELECTED_MODELS_DIR) for p in chosen]
 colors = {chosen_names[i]: palette[i % len(palette)] for i in range(len(chosen_names))}
 
 # load selected models
-bundle = {}  # label -> (arch_group, model, cfg)
+bundle = {}
 errors = []
 for p in chosen:
     label = os.path.relpath(p, SELECTED_MODELS_DIR)
@@ -362,11 +357,19 @@ for up in uploads:
 
     st.markdown(f"## {audio_name}")
 
+    if show_player:
+        mime = _guess_streamlit_audio_mime(suffix)
+        # streamlit supports autoplay in newer versions; if unavailable it will ignore safely.
+        try:
+            st.audio(audio_bytes, format=mime, autoplay=autoplay)
+        except TypeError:
+            # older streamlit versions don't have autoplay arg
+            st.audio(audio_bytes, format=mime)
+
     sr, x = load_waveform(audio_bytes, suffix, sr=44100)
     t_grid = make_common_time_grid(sr=sr, n_samples=len(x), max_points=int(max_plot_points))
     x_grid = downsample_waveform_to_grid(x, sr=sr, t_grid=t_grid)
 
-    # predict
     dfs_by_model = {}
     with st.spinner(f"Predicting for {audio_name} with {len(bundle)} model(s)..."):
         for label, (arch_name, model, cfg) in bundle.items():
@@ -375,7 +378,6 @@ for up in uploads:
             df = mod.predict_audio_bytes(model=model, cfg=cfg, audio_bytes=audio_bytes, suffix=suffix, hop_sec=hop)
             dfs_by_model[label] = df
 
-    # align predictions to waveform length via interpolation
     preds_by_model = {}
     for label, df in dfs_by_model.items():
         dose = interpolate_predictions_to_grid(df, t_grid, "dose_smooth")
