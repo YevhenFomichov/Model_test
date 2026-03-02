@@ -1,7 +1,7 @@
 import os
 import glob
 import shutil
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -68,19 +68,7 @@ def _scan_keras_in_dir(folder: str) -> List[str]:
     return sorted(glob.glob(pattern, recursive=True))
 
 
-def _list_all_models_across_folders() -> List[str]:
-    out = []
-    for _name, d in ALL_MODEL_DIRS.items():
-        out.extend(_scan_keras_in_dir(d))
-    return sorted(set(os.path.abspath(p) for p in out))
-
-
 def _find_config_for_model(model_path: str) -> Optional[str]:
-    """
-    Tries to locate config for a given model:
-      - config_<tag>.json next to model
-      - otherwise: any config_*.json next to model (fallback)
-    """
     d = os.path.dirname(os.path.abspath(model_path))
     tag = os.path.basename(model_path).replace(".keras", "")
     exact = os.path.join(d, f"config_{tag}.json")
@@ -91,10 +79,6 @@ def _find_config_for_model(model_path: str) -> Optional[str]:
 
 
 def _safe_move(src: str, dst_dir: str) -> str:
-    """
-    Moves file to dst_dir preserving basename.
-    Returns new path.
-    """
     _ensure_dir(dst_dir)
     if not os.path.isfile(src):
         raise FileNotFoundError(src)
@@ -104,7 +88,6 @@ def _safe_move(src: str, dst_dir: str) -> str:
         raise ValueError(f"Refusing to move to dir outside APP_DIR: {dst_dir}")
 
     dst = os.path.join(dst_dir, os.path.basename(src))
-    # avoid accidental overwrite
     if os.path.exists(dst):
         raise FileExistsError(f"Destination already exists: {dst}")
 
@@ -116,54 +99,115 @@ def _safe_move(src: str, dst_dir: str) -> str:
 # Model discovery for inference (only selected_models)
 # -----------------------------
 def list_all_models_selected_only() -> List[str]:
-    """
-    inference UI should list only selected_models (as you had).
-    """
     out = []
     for mod in ARCH_MODULES.values():
         out.extend(mod.list_models(SELECTED_MODELS_DIR))
     return sorted(set(out))
 
 
+# -----------------------------
+# Audio + plotting helpers
+# -----------------------------
 @st.cache_data(show_spinner=False)
-def waveform_for_display(audio_bytes: bytes, suffix: str, sr: int = 44100):
+def load_waveform(audio_bytes: bytes, suffix: str, sr: int = 44100) -> Tuple[int, np.ndarray]:
     x = arch_basic.load_audio_mono_from_bytes(audio_bytes, suffix, sr)
-    t = np.arange(len(x), dtype=np.float32) / float(sr)
-    return t, x
+    return sr, x
 
 
-def plot_waveform(t: np.ndarray, x: np.ndarray, title: str):
+def make_common_time_grid(sr: int, n_samples: int, max_points: int) -> np.ndarray:
+    """
+    Common time axis spanning full waveform duration.
+    We downsample to <= max_points for plotting.
+    """
+    duration = n_samples / float(sr)
+    if n_samples <= 1 or duration <= 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    n = int(min(max_points, n_samples))
+    # linspace gives endpoints [0, duration)
+    return np.linspace(0.0, duration, num=n, endpoint=False, dtype=np.float32)
+
+
+def downsample_waveform_to_grid(x: np.ndarray, sr: int, t_grid: np.ndarray) -> np.ndarray:
+    """
+    Interpolate waveform onto plotting grid.
+    """
+    if t_grid.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    # original time axis for waveform (in seconds)
+    t0 = np.arange(len(x), dtype=np.float32) / float(sr)
+    return np.interp(t_grid, t0, x.astype(np.float32), left=x[0], right=x[-1]).astype(np.float32)
+
+
+def interpolate_predictions_to_grid(df: pd.DataFrame, t_grid: np.ndarray, col: str) -> np.ndarray:
+    """
+    Interpolate prediction series onto t_grid.
+    Makes the visible length match waveform duration exactly.
+    Uses edge-hold extrapolation (left/right).
+    """
+    if df is None or df.empty or t_grid.size == 0:
+        return np.full((t_grid.size,), np.nan, dtype=np.float32)
+
+    # Ensure sorted
+    d = df[["time_sec", col]].dropna().sort_values("time_sec")
+    if d.empty:
+        return np.full((t_grid.size,), np.nan, dtype=np.float32)
+
+    t = d["time_sec"].to_numpy(dtype=np.float32)
+    y = d[col].to_numpy(dtype=np.float32)
+
+    # clip to [0, duration] for safety
+    duration = float(t_grid[-1]) if t_grid.size else 0.0
+    mask = (t >= 0.0) & (t <= duration + 1e-6)
+    if np.any(mask):
+        t = t[mask]
+        y = y[mask]
+
+    if t.size == 0:
+        return np.full((t_grid.size,), np.nan, dtype=np.float32)
+
+    # edge-hold extrapolation to full duration
+    return np.interp(t_grid, t, y, left=y[0], right=y[-1]).astype(np.float32)
+
+
+def plot_waveform_and_predictions(
+    t_grid: np.ndarray,
+    x_grid: np.ndarray,
+    preds_by_model: Dict[str, Dict[str, np.ndarray]],
+    colors: Dict[str, str],
+    title_prefix: str,
+):
+    # Waveform
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    ax.plot(t, x)
-    ax.set_title(title)
+    ax.plot(t_grid, x_grid)
+    ax.set_title(f"{title_prefix} — Waveform")
     ax.set_xlabel("Time, sec")
     ax.set_ylabel("Amplitude")
     ax.grid(True, alpha=0.3)
     st.pyplot(fig, clear_figure=True)
 
-
-def plot_predictions_overlay(
-    dfs_by_model: Dict[str, pd.DataFrame],
-    y_col: str,
-    title: str,
-    ylabel: str,
-    colors: Dict[str, str],
-):
+    # Dose
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    for model_name, df in dfs_by_model.items():
-        if df is None or df.empty:
-            continue
-        ax.plot(
-            df["time_sec"].to_numpy(),
-            df[y_col].to_numpy(),
-            label=model_name,
-            color=colors.get(model_name, None),
-        )
-    ax.set_title(title)
+    for name, p in preds_by_model.items():
+        ax.plot(t_grid, p["dose"], label=name, color=colors.get(name, None))
+    ax.set_title(f"{title_prefix} — Dose (smoothed, window=5) — aligned to waveform")
     ax.set_xlabel("Time, sec")
-    ax.set_ylabel(ylabel)
+    ax.set_ylabel("Dose")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right")
+    st.pyplot(fig, clear_figure=True)
+
+    # Flow
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    for name, p in preds_by_model.items():
+        ax.plot(t_grid, p["flow"], label=name, color=colors.get(name, None))
+    ax.set_title(f"{title_prefix} — Flow (smoothed, window=5) — aligned to waveform")
+    ax.set_xlabel("Time, sec")
+    ax.set_ylabel("Flow")
     ax.grid(True, alpha=0.3)
     ax.legend(loc="upper right")
     st.pyplot(fig, clear_figure=True)
@@ -187,7 +231,6 @@ def load_one_model(model_path: str):
 st.set_page_config(page_title="Inhale inference", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
-# ensure folders exist (safe)
 for d in ALL_MODEL_DIRS.values():
     _ensure_dir(d)
 
@@ -220,22 +263,22 @@ with st.sidebar:
                 failed = []
                 for mp in to_move:
                     try:
-                        # move model
-                        new_mp = _safe_move(mp, dst_dir)
-                        moved.append((_rel_to_app(mp), _rel_to_app(new_mp)))
+                        old_dir = os.path.dirname(os.path.abspath(mp))
+                        old_mp = mp
 
-                        # move config (optional)
+                        # move model
+                        new_mp = _safe_move(old_mp, dst_dir)
+                        moved.append((_rel_to_app(old_mp), _rel_to_app(new_mp)))
+
+                        # move config (optional) — look in old location
                         if move_with_config:
-                            cfg_path = _find_config_for_model(new_mp)  # after move, config still in old dir; so also check old
-                            # better: check old dir explicitly too
-                            cfg_old = _find_config_for_model(os.path.join(src_dir, os.path.basename(new_mp)))
-                            if cfg_old and os.path.exists(cfg_old):
+                            cfg_old = _find_config_for_model(old_mp)
+                            if cfg_old and os.path.exists(cfg_old) and os.path.dirname(cfg_old) == old_dir:
                                 _safe_move(cfg_old, dst_dir)
 
                     except Exception as e:
                         failed.append(f"{_rel_to_app(mp)}: {type(e).__name__}: {e}")
 
-                # clear caches because file set changed
                 st.cache_resource.clear()
                 st.cache_data.clear()
 
@@ -268,6 +311,15 @@ with st.sidebar:
         step=0.1,
     )
     use_default_hop = st.checkbox("Use hop = noise_length_sec (per model)", value=True)
+
+    st.header("Plot resolution")
+    max_plot_points = st.number_input(
+        "Max points per plot (controls downsampling, affects waveform & aligned predictions)",
+        min_value=2000,
+        max_value=200000,
+        value=20000,
+        step=1000,
+    )
 
     st.header("Upload audio")
     uploads = st.file_uploader(
@@ -310,9 +362,11 @@ for up in uploads:
 
     st.markdown(f"## {audio_name}")
 
-    t, x = waveform_for_display(audio_bytes, suffix, sr=44100)
-    plot_waveform(t, x, title=f"Waveform: {audio_name}")
+    sr, x = load_waveform(audio_bytes, suffix, sr=44100)
+    t_grid = make_common_time_grid(sr=sr, n_samples=len(x), max_points=int(max_plot_points))
+    x_grid = downsample_waveform_to_grid(x, sr=sr, t_grid=t_grid)
 
+    # predict
     dfs_by_model = {}
     with st.spinner(f"Predicting for {audio_name} with {len(bundle)} model(s)..."):
         for label, (arch_name, model, cfg) in bundle.items():
@@ -321,8 +375,20 @@ for up in uploads:
             df = mod.predict_audio_bytes(model=model, cfg=cfg, audio_bytes=audio_bytes, suffix=suffix, hop_sec=hop)
             dfs_by_model[label] = df
 
-    plot_predictions_overlay(dfs_by_model, "dose_smooth", f"Dose (smoothed, window=5): {audio_name}", "Dose", colors)
-    plot_predictions_overlay(dfs_by_model, "flow_smooth", f"Flow (smoothed, window=5): {audio_name}", "Flow", colors)
+    # align predictions to waveform length via interpolation
+    preds_by_model = {}
+    for label, df in dfs_by_model.items():
+        dose = interpolate_predictions_to_grid(df, t_grid, "dose_smooth")
+        flow = interpolate_predictions_to_grid(df, t_grid, "flow_smooth")
+        preds_by_model[label] = {"dose": dose, "flow": flow}
+
+    plot_waveform_and_predictions(
+        t_grid=t_grid,
+        x_grid=x_grid,
+        preds_by_model=preds_by_model,
+        colors=colors,
+        title_prefix=audio_name,
+    )
 
     with st.expander("Selected models details"):
         rows = []
