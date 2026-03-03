@@ -17,9 +17,8 @@ import arch_transformer
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Inference MUST remain based on selected_models only
 SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
-BEST_MODELS_DIR = os.path.join(APP_DIR, "best_models")
-BETTER_MODELS_DIR = os.path.join(APP_DIR, "better_models")
 
 ARCH_MODULES = {
     "basic": arch_basic,
@@ -28,12 +27,6 @@ ARCH_MODULES = {
     "roo": arch_roo,
     "tcn": arch_tcn,
     "transformer": arch_transformer,
-}
-
-ALL_MODEL_DIRS = {
-    "selected_models": SELECTED_MODELS_DIR,
-    "best_models": BEST_MODELS_DIR,
-    "better_models": BETTER_MODELS_DIR,
 }
 
 
@@ -95,6 +88,22 @@ def _safe_move(src: str, dst_dir: str) -> str:
     return dst
 
 
+def discover_model_dirs() -> Dict[str, str]:
+    """
+    Auto-discover folders in APP_DIR that end with '_models'.
+    This includes selected_models, best_models, better_models, plus any new *_models folders you add.
+    """
+    out: Dict[str, str] = {}
+    for name in sorted(os.listdir(APP_DIR)):
+        p = os.path.join(APP_DIR, name)
+        if os.path.isdir(p) and name.endswith("_models"):
+            out[name] = p
+    # Ensure selected_models exists in dict (and on disk)
+    out.setdefault("selected_models", SELECTED_MODELS_DIR)
+    _ensure_dir(out["selected_models"])
+    return out
+
+
 # -----------------------------
 # Model discovery for inference (only selected_models)
 # -----------------------------
@@ -110,6 +119,7 @@ def list_all_models_selected_only() -> List[str]:
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def load_waveform(audio_bytes: bytes, suffix: str, sr: int = 44100) -> Tuple[int, np.ndarray]:
+    # all handlers should share same loader; we use the stable one from arch_basic
     x = arch_basic.load_audio_mono_from_bytes(audio_bytes, suffix, sr)
     return sr, x
 
@@ -130,6 +140,10 @@ def downsample_waveform_to_grid(x: np.ndarray, sr: int, t_grid: np.ndarray) -> n
 
 
 def interpolate_predictions_to_grid(df: pd.DataFrame, t_grid: np.ndarray, col: str) -> np.ndarray:
+    """
+    Interpolate prediction series onto t_grid so it matches waveform duration exactly.
+    Uses edge-hold extrapolation to cover full [0, duration).
+    """
     if df is None or df.empty or t_grid.size == 0:
         return np.full((t_grid.size,), np.nan, dtype=np.float32)
 
@@ -224,6 +238,9 @@ def _guess_streamlit_audio_mime(suffix: str) -> str:
 st.set_page_config(page_title="Inhale inference", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
+ALL_MODEL_DIRS = discover_model_dirs()
+
+# ensure discovered dirs exist
 for d in ALL_MODEL_DIRS.values():
     _ensure_dir(d)
 
@@ -232,9 +249,19 @@ with st.sidebar:
     enable_manager = st.checkbox("Enable moving models between folders", value=False)
 
     if enable_manager:
+        st.caption("Folders are auto-detected: any directory in repo root ending with '_models'.")
         st.caption("Move .keras files (and matching config_*.json when found) between folders.")
-        src_folder_name = st.selectbox("Source folder", options=list(ALL_MODEL_DIRS.keys()), index=0)
-        dst_folder_name = st.selectbox("Destination folder", options=list(ALL_MODEL_DIRS.keys()), index=1)
+
+        folder_names = list(ALL_MODEL_DIRS.keys())
+        # Put selected_models first for convenience
+        folder_names = ["selected_models"] + [n for n in folder_names if n != "selected_models"]
+
+        src_folder_name = st.selectbox("Source folder", options=folder_names, index=0)
+        dst_folder_name = st.selectbox(
+            "Destination folder",
+            options=folder_names,
+            index=min(1, len(folder_names) - 1),
+        )
 
         src_dir = ALL_MODEL_DIRS[src_folder_name]
         dst_dir = ALL_MODEL_DIRS[dst_folder_name]
@@ -251,7 +278,11 @@ with st.sidebar:
 
             move_with_config = st.checkbox("Also move matching config_*.json (if found next to model)", value=True)
 
-            if st.button("Move selected", type="primary", disabled=(len(to_move) == 0 or src_folder_name == dst_folder_name)):
+            if st.button(
+                "Move selected",
+                type="primary",
+                disabled=(len(to_move) == 0 or src_folder_name == dst_folder_name),
+            ):
                 moved = []
                 failed = []
                 for mp in to_move:
@@ -259,9 +290,11 @@ with st.sidebar:
                         old_dir = os.path.dirname(os.path.abspath(mp))
                         old_mp = mp
 
+                        # move model
                         new_mp = _safe_move(old_mp, dst_dir)
                         moved.append((_rel_to_app(old_mp), _rel_to_app(new_mp)))
 
+                        # move config (optional) — look in old location
                         if move_with_config:
                             cfg_old = _find_config_for_model(old_mp)
                             if cfg_old and os.path.exists(cfg_old) and os.path.dirname(cfg_old) == old_dir:
@@ -270,6 +303,7 @@ with st.sidebar:
                     except Exception as e:
                         failed.append(f"{_rel_to_app(mp)}: {type(e).__name__}: {e}")
 
+                # clear caches because file set changed
                 st.cache_resource.clear()
                 st.cache_data.clear()
 
@@ -359,11 +393,9 @@ for up in uploads:
 
     if show_player:
         mime = _guess_streamlit_audio_mime(suffix)
-        # streamlit supports autoplay in newer versions; if unavailable it will ignore safely.
         try:
             st.audio(audio_bytes, format=mime, autoplay=autoplay)
         except TypeError:
-            # older streamlit versions don't have autoplay arg
             st.audio(audio_bytes, format=mime)
 
     sr, x = load_waveform(audio_bytes, suffix, sr=44100)
