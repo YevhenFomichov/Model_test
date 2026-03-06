@@ -1,8 +1,6 @@
 import glob
 import os
-import re
-import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -34,9 +32,11 @@ MODEL_FOLDERS = [
     "delete_models",
     "selected_models",
     "tested_models",
+    "dose_models",
+    "flow_models",
 ]
 
-SELECTED_FOLDER = "selected_models"
+DEFAULT_INFERENCE_FOLDERS = MODEL_FOLDERS[:]  # now all folders are available for testing
 
 
 # -----------------------------
@@ -157,22 +157,30 @@ def get_github_store() -> GitHubRepoStore:
     return GitHubRepoStore(cfg)
 
 
-def _sanitize_branch_name(s: str) -> str:
-    s = re.sub(r"[^0-9A-Za-z_\-/]+", "-", s).strip("-")
-    return s[:80] if len(s) > 80 else s
+def resolve_config_path_for_model(local_model_path: str) -> Optional[str]:
+    """
+    Exact matching config:
+      /folder/model_tag.keras -> /folder/config_model_tag.json
+    No fallback to random config file.
+    """
+    d = os.path.dirname(os.path.abspath(local_model_path))
+    tag = os.path.basename(local_model_path).replace(".keras", "")
+    cfg = os.path.join(d, f"config_{tag}.json")
+    return cfg if os.path.exists(cfg) else None
 
 
 # -----------------------------
 # Local inference model loading
 # -----------------------------
-def scan_local_selected_models() -> List[str]:
-    """
-    No dependency on arch_module.list_models().
-    Just scan selected_models recursively for .keras.
-    """
-    selected_dir_local = os.path.join(APP_DIR, SELECTED_FOLDER)
-    pattern = os.path.join(selected_dir_local, "**", "*.keras")
-    return sorted(set(glob.glob(pattern, recursive=True)))
+def scan_local_models_from_folders(folders: List[str]) -> List[str]:
+    out = []
+    for folder in folders:
+        folder_abs = os.path.join(APP_DIR, folder)
+        if not os.path.isdir(folder_abs):
+            continue
+        pattern = os.path.join(folder_abs, "**", "*.keras")
+        out.extend(glob.glob(pattern, recursive=True))
+    return sorted(set(out))
 
 
 @st.cache_resource(show_spinner=False)
@@ -186,15 +194,19 @@ def load_one_model_local(model_path: str):
     raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
 
 
+def display_label_for_model(model_path: str) -> str:
+    return os.path.relpath(model_path, APP_DIR)
+
+
 # -----------------------------
 # Streamlit app
 # -----------------------------
-st.set_page_config(page_title="Inhale inference + GitHub PR moving", layout="wide")
+st.set_page_config(page_title="Inhale inference + GitHub main commits", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
 with st.sidebar:
-    st.header("GitHub model manager (moves via PR)")
-    st.caption("This creates a GitHub Pull Request that moves selected files between folders.")
+    st.header("GitHub model manager (direct commit to main)")
+    st.caption("This commits file moves directly into the main branch.")
 
     entered_pwd = st.text_input("Admin password", type="password", key="admin_pwd")
     secret_pwd = st.secrets.get("ADMIN_MOVE_PASSWORD", None)
@@ -219,24 +231,29 @@ with st.sidebar:
     )
 
     move_with_config = st.checkbox(
-        "Also move matching config_*.json",
+        "Also move exact matching config_<model_tag>.json",
         value=True,
         disabled=(not can_move),
     )
 
     st.divider()
     st.header("Inference")
-    st.caption("Inference reads from local repo checkout (selected_models/)")
 
-    all_models_local = scan_local_selected_models()
+    inference_folders = st.multiselect(
+        "Folders used for model testing",
+        options=MODEL_FOLDERS,
+        default=DEFAULT_INFERENCE_FOLDERS,
+    )
+
+    all_models_local = scan_local_models_from_folders(inference_folders)
     if not all_models_local:
-        st.error("No models found in local selected_models/")
+        st.error("No models found in selected inference folders.")
         st.stop()
 
     chosen = st.multiselect(
         "Select up to 3 models",
         options=all_models_local,
-        format_func=lambda p: os.path.relpath(p, os.path.join(APP_DIR, SELECTED_FOLDER)),
+        format_func=display_label_for_model,
         max_selections=3,
     )
 
@@ -265,12 +282,12 @@ with st.sidebar:
     )
 
 # -----------------------------
-# GitHub move UI
+# Direct GitHub move UI
 # -----------------------------
 if enable_manager and can_move:
     store = get_github_store()
 
-    st.subheader("Move models in GitHub (creates PR)")
+    st.subheader("Move models in GitHub (direct commit to main)")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -302,14 +319,10 @@ if enable_manager and can_move:
         )
 
         if st.button(
-            "Create PR to move selected",
+            "Move selected directly to main",
             type="primary",
             disabled=(len(selected_files) == 0 or src_folder == dst_folder),
         ):
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            branch = _sanitize_branch_name(f"move-models/{src_folder}-to-{dst_folder}-{stamp}")
-            store.create_branch_from(store.cfg.branch, branch)
-
             moved = []
             failed = []
 
@@ -319,47 +332,38 @@ if enable_manager and can_move:
                 dst_path = f"{dst_folder}/{base}"
 
                 try:
-                    store.move_file_via_branch(
+                    store.move_file(
                         src_path=src_path,
                         dst_path=dst_path,
-                        branch=branch,
-                        message_prefix="Move model",
+                        message_prefix=f"Move model {base}",
+                        branch=store.cfg.branch,
                         overwrite=False,
                     )
                     moved.append(f"{src_path} -> {dst_path}")
 
                     if move_with_config:
-                        tag = base.replace(".keras", "")
-                        cfg_src = f"{src_folder}/config_{tag}.json"
-                        cfg_dst = f"{dst_folder}/config_{tag}.json"
-                        try:
-                            _bytes, _sha = store.get_content(cfg_src, ref=branch)
-                            store.move_file_via_branch(
+                        cfg_local = resolve_config_path_for_model(local_path)
+                        if cfg_local:
+                            cfg_base = os.path.basename(cfg_local)
+                            cfg_src = f"{src_folder}/{cfg_base}"
+                            cfg_dst = f"{dst_folder}/{cfg_base}"
+
+                            store.move_file(
                                 src_path=cfg_src,
                                 dst_path=cfg_dst,
-                                branch=branch,
-                                message_prefix="Move config",
+                                message_prefix=f"Move config {cfg_base}",
+                                branch=store.cfg.branch,
                                 overwrite=False,
                             )
                             moved.append(f"{cfg_src} -> {cfg_dst}")
-                        except Exception:
-                            pass
 
                 except Exception as e:
                     failed.append(f"{src_path}: {type(e).__name__}: {e}")
 
-            if moved and not failed:
-                pr_url = store.create_pull_request(
-                    head_branch=branch,
-                    title=f"Move models: {src_folder} -> {dst_folder} ({stamp})",
-                    body="Automated move from Streamlit UI.\n\nFiles moved:\n- " + "\n- ".join(moved),
-                )
-                st.success(f"PR created: {pr_url}")
-            else:
-                if moved:
-                    st.info("Moved on branch:\n" + "\n".join(moved))
-                if failed:
-                    st.error("Failed:\n" + "\n".join(failed))
+            if moved:
+                st.success("Committed to main:\n" + "\n".join(moved))
+            if failed:
+                st.error("Failed:\n" + "\n".join(failed))
 
     st.divider()
 
@@ -374,16 +378,14 @@ if not uploads:
     st.info("Upload one or more audio files in the sidebar.")
     st.stop()
 
-selected_dir_local = os.path.join(APP_DIR, SELECTED_FOLDER)
-
 palette = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3", "C4"])
-chosen_names = [os.path.relpath(p, selected_dir_local) for p in chosen]
+chosen_names = [display_label_for_model(p) for p in chosen]
 colors = {chosen_names[i]: palette[i % len(palette)] for i in range(len(chosen_names))}
 
 bundle = {}
 errors = []
 for p in chosen:
-    label = os.path.relpath(p, selected_dir_local)
+    label = display_label_for_model(p)
     try:
         arch_name, model, cfg = load_one_model_local(p)
         bundle[label] = (arch_name, model, cfg)
