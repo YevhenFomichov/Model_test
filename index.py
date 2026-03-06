@@ -165,18 +165,22 @@ def _sanitize_branch_name(s: str) -> str:
 # -----------------------------
 # Local inference model loading
 # -----------------------------
-def list_local_selected_models() -> List[str]:
+def scan_local_selected_models() -> List[str]:
+    """
+    No dependency on arch_module.list_models().
+    Just scan selected_models recursively for .keras.
+    """
     selected_dir_local = os.path.join(APP_DIR, SELECTED_FOLDER)
-    out = []
-    for mod in ARCH_MODULES.values():
-        out.extend(mod.list_models(selected_dir_local))
-    return sorted(set(out))
+    pattern = os.path.join(selected_dir_local, "**", "*.keras")
+    return sorted(set(glob.glob(pattern, recursive=True)))
 
 
 @st.cache_resource(show_spinner=False)
 def load_one_model_local(model_path: str):
     for arch_name, mod in ARCH_MODULES.items():
-        if mod.can_handle_model(model_path):
+        if hasattr(mod, "can_handle_model") and mod.can_handle_model(model_path):
+            if not hasattr(mod, "load_model_and_cfg"):
+                raise AttributeError(f"Module {mod.__name__} has no load_model_and_cfg")
             model, cfg = mod.load_model_and_cfg(model_path)
             return arch_name, model, cfg
     raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
@@ -224,7 +228,7 @@ with st.sidebar:
     st.header("Inference")
     st.caption("Inference reads from local repo checkout (selected_models/)")
 
-    all_models_local = list_local_selected_models()
+    all_models_local = scan_local_selected_models()
     if not all_models_local:
         st.error("No models found in local selected_models/")
         st.stop()
