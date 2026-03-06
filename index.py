@@ -36,7 +36,7 @@ MODEL_FOLDERS = [
     "flow_models",
 ]
 
-DEFAULT_INFERENCE_FOLDERS = MODEL_FOLDERS[:]  # now all folders are available for testing
+DEFAULT_INFERENCE_FOLDERS = MODEL_FOLDERS[:]
 
 
 # -----------------------------
@@ -157,16 +157,21 @@ def get_github_store() -> GitHubRepoStore:
     return GitHubRepoStore(cfg)
 
 
-def resolve_config_path_for_model(local_model_path: str) -> Optional[str]:
+# -----------------------------
+# Config/json matching
+# -----------------------------
+def resolve_json_path_for_model(local_model_path: str) -> Optional[str]:
     """
-    Exact matching config:
-      /folder/model_tag.keras -> /folder/config_model_tag.json
-    No fallback to random config file.
+    Exact matching json:
+      /folder/model_tag.keras -> /folder/model_tag.json
+
+    Example:
+      basic_raw_None_mse.keras -> basic_raw_None_mse.json
     """
     d = os.path.dirname(os.path.abspath(local_model_path))
     tag = os.path.basename(local_model_path).replace(".keras", "")
-    cfg = os.path.join(d, f"config_{tag}.json")
-    return cfg if os.path.exists(cfg) else None
+    js = os.path.join(d, f"{tag}.json")
+    return js if os.path.exists(js) else None
 
 
 # -----------------------------
@@ -230,8 +235,8 @@ with st.sidebar:
         disabled=(not can_move),
     )
 
-    move_with_config = st.checkbox(
-        "Also move exact matching config_<model_tag>.json",
+    move_with_json = st.checkbox(
+        "Also move exact matching .json",
         value=True,
         disabled=(not can_move),
     )
@@ -341,21 +346,21 @@ if enable_manager and can_move:
                     )
                     moved.append(f"{src_path} -> {dst_path}")
 
-                    if move_with_config:
-                        cfg_local = resolve_config_path_for_model(local_path)
-                        if cfg_local:
-                            cfg_base = os.path.basename(cfg_local)
-                            cfg_src = f"{src_folder}/{cfg_base}"
-                            cfg_dst = f"{dst_folder}/{cfg_base}"
+                    if move_with_json:
+                        js_local = resolve_json_path_for_model(local_path)
+                        if js_local:
+                            js_base = os.path.basename(js_local)
+                            js_src = f"{src_folder}/{js_base}"
+                            js_dst = f"{dst_folder}/{js_base}"
 
                             store.move_file(
-                                src_path=cfg_src,
-                                dst_path=cfg_dst,
-                                message_prefix=f"Move config {cfg_base}",
+                                src_path=js_src,
+                                dst_path=js_dst,
+                                message_prefix=f"Move json {js_base}",
                                 branch=store.cfg.branch,
                                 overwrite=False,
                             )
-                            moved.append(f"{cfg_src} -> {cfg_dst}")
+                            moved.append(f"{js_src} -> {js_dst}")
 
                 except Exception as e:
                     failed.append(f"{src_path}: {type(e).__name__}: {e}")
