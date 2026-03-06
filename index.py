@@ -1,12 +1,13 @@
+import glob
 import os
 import re
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
 import arch_basic
 import arch_cnn
@@ -14,8 +15,7 @@ import arch_dual
 import arch_roo
 import arch_tcn
 import arch_transformer
-
-from github_store import GitHubRepoStore, GitHubConfig
+from github_store import GitHubConfig, GitHubRepoStore
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -28,7 +28,6 @@ ARCH_MODULES = {
     "transformer": arch_transformer,
 }
 
-# Your repo folders (as you listed)
 MODEL_FOLDERS = [
     "best_models",
     "better_models",
@@ -148,6 +147,7 @@ def get_github_store() -> GitHubRepoStore:
     gh = st.secrets.get("github", None)
     if gh is None:
         raise RuntimeError("Missing [github] section in Streamlit secrets.")
+
     cfg = GitHubConfig(
         owner=str(gh["owner"]),
         repo=str(gh["repo"]),
@@ -157,55 +157,74 @@ def get_github_store() -> GitHubRepoStore:
     return GitHubRepoStore(cfg)
 
 
-def is_move_allowed() -> bool:
-    """
-    Gate write access by password, so you don't expose a write token to all users.
-    """
-    pwd = st.secrets.get("ADMIN_MOVE_PASSWORD", None)
-    if not pwd:
-        # if not set, disable move completely
-        return False
-    entered = st.session_state.get("admin_pwd", "")
-    return entered == str(pwd)
-
-
 def _sanitize_branch_name(s: str) -> str:
-    s = re.sub(r"[^0-9A-Za-z_\-\/]+", "-", s).strip("-")
+    s = re.sub(r"[^0-9A-Za-z_\-/]+", "-", s).strip("-")
     return s[:80] if len(s) > 80 else s
 
 
 # -----------------------------
-# App
+# Local inference model loading
 # -----------------------------
-st.set_page_config(page_title="Inhale inference (Git move)", layout="wide")
+def list_local_selected_models() -> List[str]:
+    selected_dir_local = os.path.join(APP_DIR, SELECTED_FOLDER)
+    out = []
+    for mod in ARCH_MODULES.values():
+        out.extend(mod.list_models(selected_dir_local))
+    return sorted(set(out))
+
+
+@st.cache_resource(show_spinner=False)
+def load_one_model_local(model_path: str):
+    for arch_name, mod in ARCH_MODULES.items():
+        if mod.can_handle_model(model_path):
+            model, cfg = mod.load_model_and_cfg(model_path)
+            return arch_name, model, cfg
+    raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
+
+
+# -----------------------------
+# Streamlit app
+# -----------------------------
+st.set_page_config(page_title="Inhale inference + GitHub PR moving", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
 with st.sidebar:
     st.header("GitHub model manager (moves via PR)")
-
     st.caption("This creates a GitHub Pull Request that moves selected files between folders.")
-    st.text_input("Admin password", type="password", key="admin_pwd")
-    can_move = is_move_allowed()
 
-    enable_manager = st.checkbox("Enable moving models between folders", value=False, disabled=(not can_move))
-    move_with_config = st.checkbox("Also move matching config_*.json", value=True, disabled=(not can_move))
+    entered_pwd = st.text_input("Admin password", type="password", key="admin_pwd")
+    secret_pwd = st.secrets.get("ADMIN_MOVE_PASSWORD", None)
+
+    if not secret_pwd:
+        st.warning("ADMIN_MOVE_PASSWORD is not set in secrets. Move feature is disabled.")
+        can_move = False
+    elif not entered_pwd:
+        st.info("Enter admin password to unlock model moving.")
+        can_move = False
+    elif entered_pwd == str(secret_pwd):
+        st.success("Password accepted. Model moving is unlocked.")
+        can_move = True
+    else:
+        st.error("Wrong password.")
+        can_move = False
+
+    enable_manager = st.checkbox(
+        "Enable moving models between folders",
+        value=False,
+        disabled=(not can_move),
+    )
+
+    move_with_config = st.checkbox(
+        "Also move matching config_*.json",
+        value=True,
+        disabled=(not can_move),
+    )
 
     st.divider()
     st.header("Inference")
     st.caption("Inference reads from local repo checkout (selected_models/)")
 
-    # Local scan for inference (same as before)
-    selected_dir_local = os.path.join(APP_DIR, SELECTED_FOLDER)
-    if not os.path.isdir(selected_dir_local):
-        st.error(f"Folder not found locally: {selected_dir_local}")
-        st.stop()
-
-    # reuse your arch modules' list_models for local inference
-    all_models_local = []
-    for mod in ARCH_MODULES.values():
-        all_models_local.extend(mod.list_models(selected_dir_local))
-    all_models_local = sorted(set(all_models_local))
-
+    all_models_local = list_local_selected_models()
     if not all_models_local:
         st.error("No models found in local selected_models/")
         st.stop()
@@ -213,7 +232,7 @@ with st.sidebar:
     chosen = st.multiselect(
         "Select up to 3 models",
         options=all_models_local,
-        format_func=lambda p: os.path.relpath(p, selected_dir_local),
+        format_func=lambda p: os.path.relpath(p, os.path.join(APP_DIR, SELECTED_FOLDER)),
         max_selections=3,
     )
 
@@ -222,7 +241,13 @@ with st.sidebar:
     use_default_hop = st.checkbox("Use hop = noise_length_sec (per model)", value=True)
 
     st.header("Plot resolution")
-    max_plot_points = st.number_input("Max points per plot", min_value=2000, max_value=200000, value=20000, step=1000)
+    max_plot_points = st.number_input(
+        "Max points per plot",
+        min_value=2000,
+        max_value=200000,
+        value=20000,
+        step=1000,
+    )
 
     st.header("Audio player")
     show_player = st.checkbox("Show audio player", value=True)
@@ -235,27 +260,36 @@ with st.sidebar:
         accept_multiple_files=True,
     )
 
-# --- Git move UI (main area) ---
-if enable_manager and is_move_allowed():
+# -----------------------------
+# GitHub move UI
+# -----------------------------
+if enable_manager and can_move:
     store = get_github_store()
+
     st.subheader("Move models in GitHub (creates PR)")
 
     c1, c2 = st.columns(2)
     with c1:
-        src_folder = st.selectbox("Source folder", options=MODEL_FOLDERS, index=MODEL_FOLDERS.index("selected_models"))
+        src_folder = st.selectbox(
+            "Source folder",
+            options=MODEL_FOLDERS,
+            index=MODEL_FOLDERS.index("selected_models"),
+            key="src_folder",
+        )
     with c2:
-        dst_folder = st.selectbox("Destination folder", options=MODEL_FOLDERS, index=MODEL_FOLDERS.index("tested_models"))
+        dst_folder = st.selectbox(
+            "Destination folder",
+            options=MODEL_FOLDERS,
+            index=MODEL_FOLDERS.index("tested_models"),
+            key="dst_folder",
+        )
 
-    # List .keras in src folder on GitHub
-    # Using contents API requires exact paths, we do a lightweight approach:
-    # We'll rely on local file listing for selection UI and then operate on those names in GitHub.
-    # IMPORTANT: This means repo checkout must be up to date with GitHub.
     src_local = os.path.join(APP_DIR, src_folder)
     os.makedirs(src_local, exist_ok=True)
-    keras_local = sorted([p for p in glob.glob(os.path.join(src_local, "*.keras"))])
+    keras_local = sorted(glob.glob(os.path.join(src_local, "*.keras")))
 
     if not keras_local:
-        st.info(f"No .keras files found locally in {src_folder}/. (Ensure repo checkout contains files.)")
+        st.info(f"No .keras files found locally in {src_folder}/")
     else:
         selected_files = st.multiselect(
             "Select .keras files to move",
@@ -263,17 +297,23 @@ if enable_manager and is_move_allowed():
             format_func=lambda p: os.path.basename(p),
         )
 
-        if st.button("Create PR to move selected", type="primary", disabled=(len(selected_files) == 0 or src_folder == dst_folder)):
-            # Create new branch
+        if st.button(
+            "Create PR to move selected",
+            type="primary",
+            disabled=(len(selected_files) == 0 or src_folder == dst_folder),
+        ):
             stamp = time.strftime("%Y%m%d-%H%M%S")
             branch = _sanitize_branch_name(f"move-models/{src_folder}-to-{dst_folder}-{stamp}")
             store.create_branch_from(store.cfg.branch, branch)
 
-            moved, failed = [], []
+            moved = []
+            failed = []
+
             for local_path in selected_files:
                 base = os.path.basename(local_path)
                 src_path = f"{src_folder}/{base}"
                 dst_path = f"{dst_folder}/{base}"
+
                 try:
                     store.move_file_via_branch(
                         src_path=src_path,
@@ -285,12 +325,10 @@ if enable_manager and is_move_allowed():
                     moved.append(f"{src_path} -> {dst_path}")
 
                     if move_with_config:
-                        # try config_<tag>.json
                         tag = base.replace(".keras", "")
                         cfg_src = f"{src_folder}/config_{tag}.json"
                         cfg_dst = f"{dst_folder}/config_{tag}.json"
                         try:
-                            # If config exists, move it too
                             _bytes, _sha = store.get_content(cfg_src, ref=branch)
                             store.move_file_via_branch(
                                 src_path=cfg_src,
@@ -301,7 +339,6 @@ if enable_manager and is_move_allowed():
                             )
                             moved.append(f"{cfg_src} -> {cfg_dst}")
                         except Exception:
-                            # config may not exist — ignore
                             pass
 
                 except Exception as e:
@@ -313,37 +350,34 @@ if enable_manager and is_move_allowed():
                     title=f"Move models: {src_folder} -> {dst_folder} ({stamp})",
                     body="Automated move from Streamlit UI.\n\nFiles moved:\n- " + "\n- ".join(moved),
                 )
-                st.success("PR created: " + pr_url)
+                st.success(f"PR created: {pr_url}")
             else:
-                st.error("Move result:\n\nMoved:\n" + "\n".join(moved) + "\n\nFailed:\n" + "\n".join(failed))
+                if moved:
+                    st.info("Moved on branch:\n" + "\n".join(moved))
+                if failed:
+                    st.error("Failed:\n" + "\n".join(failed))
 
     st.divider()
 
-# --- Inference ---
+# -----------------------------
+# Inference
+# -----------------------------
 if not chosen:
     st.info("Select 1–3 models in the sidebar.")
     st.stop()
+
 if not uploads:
     st.info("Upload one or more audio files in the sidebar.")
     st.stop()
 
+selected_dir_local = os.path.join(APP_DIR, SELECTED_FOLDER)
+
 palette = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3", "C4"])
-chosen_names = [os.path.relpath(p, os.path.join(APP_DIR, SELECTED_FOLDER)) for p in chosen]
+chosen_names = [os.path.relpath(p, selected_dir_local) for p in chosen]
 colors = {chosen_names[i]: palette[i % len(palette)] for i in range(len(chosen_names))}
-
-# Load local models (same as your current architecture modules expect local paths)
-@st.cache_resource(show_spinner=False)
-def load_one_model_local(model_path: str):
-    for arch_name, mod in ARCH_MODULES.items():
-        if mod.can_handle_model(model_path):
-            model, cfg = mod.load_model_and_cfg(model_path)
-            return arch_name, model, cfg
-    raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
-
 
 bundle = {}
 errors = []
-selected_dir_local = os.path.join(APP_DIR, SELECTED_FOLDER)
 for p in chosen:
     label = os.path.relpath(p, selected_dir_local)
     try:
@@ -379,7 +413,13 @@ for up in uploads:
         for label, (arch_name, model, cfg) in bundle.items():
             hop = None if use_default_hop else float(hop_sec)
             mod = ARCH_MODULES[arch_name]
-            df = mod.predict_audio_bytes(model=model, cfg=cfg, audio_bytes=audio_bytes, suffix=suffix, hop_sec=hop)
+            df = mod.predict_audio_bytes(
+                model=model,
+                cfg=cfg,
+                audio_bytes=audio_bytes,
+                suffix=suffix,
+                hop_sec=hop,
+            )
             dfs_by_model[label] = df
 
     preds_by_model = {}
@@ -396,3 +436,19 @@ for up in uploads:
         colors=colors,
         title_prefix=audio_name,
     )
+
+    with st.expander("Selected models details"):
+        rows = []
+        for label, (arch_name, _m, cfg) in bundle.items():
+            rows.append({
+                "model": label,
+                "arch_group": arch_name,
+                "model_type": cfg.get("model_type"),
+                "feature_type": cfg.get("feature_type"),
+                "transform": cfg.get("transformation_method"),
+                "loss_type": cfg.get("loss_type"),
+                "sample_rate": cfg.get("sample_rate"),
+                "noise_length_sec": cfg.get("noise_length_sec"),
+                "frame_length_sec": cfg.get("frame_length_sec"),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
