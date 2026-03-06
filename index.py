@@ -164,9 +164,6 @@ def resolve_json_path_for_model(local_model_path: str) -> Optional[str]:
     """
     Exact matching json:
       /folder/model_tag.keras -> /folder/model_tag.json
-
-    Example:
-      basic_raw_None_mse.keras -> basic_raw_None_mse.json
     """
     d = os.path.dirname(os.path.abspath(local_model_path))
     tag = os.path.basename(local_model_path).replace(".keras", "")
@@ -200,7 +197,7 @@ def load_one_model_local(model_path: str):
 
 
 def display_label_for_model(model_path: str) -> str:
-    return os.path.relpath(model_path, APP_DIR)
+    return os.path.basename(model_path)
 
 
 # -----------------------------
@@ -344,7 +341,7 @@ if enable_manager and can_move:
                         branch=store.cfg.branch,
                         overwrite=False,
                     )
-                    moved.append(f"{src_path} -> {dst_path}")
+                    moved.append(f"{base}")
 
                     if move_with_json:
                         js_local = resolve_json_path_for_model(local_path)
@@ -360,10 +357,9 @@ if enable_manager and can_move:
                                 branch=store.cfg.branch,
                                 overwrite=False,
                             )
-                            moved.append(f"{js_src} -> {js_dst}")
 
                 except Exception as e:
-                    failed.append(f"{src_path}: {type(e).__name__}: {e}")
+                    failed.append(f"{base}: {type(e).__name__}: {e}")
 
             if moved:
                 st.success("Committed to main:\n" + "\n".join(moved))
