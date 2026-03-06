@@ -1,6 +1,6 @@
 import os
-import glob
-import shutil
+import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -15,10 +15,9 @@ import arch_roo
 import arch_tcn
 import arch_transformer
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+from github_store import GitHubRepoStore, GitHubConfig
 
-# Inference MUST remain based on selected_models only
-SELECTED_MODELS_DIR = os.path.join(APP_DIR, "selected_models")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ARCH_MODULES = {
     "basic": arch_basic,
@@ -29,89 +28,16 @@ ARCH_MODULES = {
     "transformer": arch_transformer,
 }
 
+# Your repo folders (as you listed)
+MODEL_FOLDERS = [
+    "best_models",
+    "better_models",
+    "delete_models",
+    "selected_models",
+    "tested_models",
+]
 
-# -----------------------------
-# Helpers: safe paths + scanning
-# -----------------------------
-def _ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
-
-
-def _is_inside(base_dir: str, path: str) -> bool:
-    base = os.path.realpath(base_dir)
-    p = os.path.realpath(path)
-    try:
-        common = os.path.commonpath([base, p])
-    except Exception:
-        return False
-    return common == base
-
-
-def _rel_to_app(path: str) -> str:
-    try:
-        return os.path.relpath(path, APP_DIR)
-    except Exception:
-        return path
-
-
-def _scan_keras_in_dir(folder: str) -> List[str]:
-    if not os.path.isdir(folder):
-        return []
-    pattern = os.path.join(os.path.abspath(folder), "**", "*.keras")
-    return sorted(glob.glob(pattern, recursive=True))
-
-
-def _find_config_for_model(model_path: str) -> Optional[str]:
-    d = os.path.dirname(os.path.abspath(model_path))
-    tag = os.path.basename(model_path).replace(".keras", "")
-    exact = os.path.join(d, f"config_{tag}.json")
-    if os.path.exists(exact):
-        return exact
-    cands = sorted(glob.glob(os.path.join(d, "config_*.json")))
-    return cands[0] if cands else None
-
-
-def _safe_move(src: str, dst_dir: str) -> str:
-    _ensure_dir(dst_dir)
-    if not os.path.isfile(src):
-        raise FileNotFoundError(src)
-    if not _is_inside(APP_DIR, src):
-        raise ValueError(f"Refusing to move file outside APP_DIR: {src}")
-    if not _is_inside(APP_DIR, dst_dir):
-        raise ValueError(f"Refusing to move to dir outside APP_DIR: {dst_dir}")
-
-    dst = os.path.join(dst_dir, os.path.basename(src))
-    if os.path.exists(dst):
-        raise FileExistsError(f"Destination already exists: {dst}")
-
-    shutil.move(src, dst)
-    return dst
-
-
-def discover_model_dirs() -> Dict[str, str]:
-    """
-    Auto-discover folders in APP_DIR that end with '_models'.
-    This includes selected_models, best_models, better_models, plus any new *_models folders you add.
-    """
-    out: Dict[str, str] = {}
-    for name in sorted(os.listdir(APP_DIR)):
-        p = os.path.join(APP_DIR, name)
-        if os.path.isdir(p) and name.endswith("_models"):
-            out[name] = p
-    # Ensure selected_models exists in dict (and on disk)
-    out.setdefault("selected_models", SELECTED_MODELS_DIR)
-    _ensure_dir(out["selected_models"])
-    return out
-
-
-# -----------------------------
-# Model discovery for inference (only selected_models)
-# -----------------------------
-def list_all_models_selected_only() -> List[str]:
-    out = []
-    for mod in ARCH_MODULES.values():
-        out.extend(mod.list_models(SELECTED_MODELS_DIR))
-    return sorted(set(out))
+SELECTED_FOLDER = "selected_models"
 
 
 # -----------------------------
@@ -119,7 +45,6 @@ def list_all_models_selected_only() -> List[str]:
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def load_waveform(audio_bytes: bytes, suffix: str, sr: int = 44100) -> Tuple[int, np.ndarray]:
-    # all handlers should share same loader; we use the stable one from arch_basic
     x = arch_basic.load_audio_mono_from_bytes(audio_bytes, suffix, sr)
     return sr, x
 
@@ -140,10 +65,6 @@ def downsample_waveform_to_grid(x: np.ndarray, sr: int, t_grid: np.ndarray) -> n
 
 
 def interpolate_predictions_to_grid(df: pd.DataFrame, t_grid: np.ndarray, col: str) -> np.ndarray:
-    """
-    Interpolate prediction series onto t_grid so it matches waveform duration exactly.
-    Uses edge-hold extrapolation to cover full [0, duration).
-    """
     if df is None or df.empty or t_grid.size == 0:
         return np.full((t_grid.size,), np.nan, dtype=np.float32)
 
@@ -205,18 +126,6 @@ def plot_waveform_and_predictions(
     st.pyplot(fig, clear_figure=True)
 
 
-# -----------------------------
-# Load model routing (by handler)
-# -----------------------------
-@st.cache_resource(show_spinner=False)
-def load_one_model(model_path: str):
-    for arch_name, mod in ARCH_MODULES.items():
-        if mod.can_handle_model(model_path):
-            model, cfg = mod.load_model_and_cfg(model_path)
-            return arch_name, model, cfg
-    raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
-
-
 def _guess_streamlit_audio_mime(suffix: str) -> str:
     s = suffix.lower()
     if s == ".wav":
@@ -233,130 +142,184 @@ def _guess_streamlit_audio_mime(suffix: str) -> str:
 
 
 # -----------------------------
-# Streamlit App
+# GitHub store
 # -----------------------------
-st.set_page_config(page_title="Inhale inference", layout="wide")
+def get_github_store() -> GitHubRepoStore:
+    gh = st.secrets.get("github", None)
+    if gh is None:
+        raise RuntimeError("Missing [github] section in Streamlit secrets.")
+    cfg = GitHubConfig(
+        owner=str(gh["owner"]),
+        repo=str(gh["repo"]),
+        token=str(gh["token"]),
+        branch=str(gh.get("branch", "main")),
+    )
+    return GitHubRepoStore(cfg)
+
+
+def is_move_allowed() -> bool:
+    """
+    Gate write access by password, so you don't expose a write token to all users.
+    """
+    pwd = st.secrets.get("ADMIN_MOVE_PASSWORD", None)
+    if not pwd:
+        # if not set, disable move completely
+        return False
+    entered = st.session_state.get("admin_pwd", "")
+    return entered == str(pwd)
+
+
+def _sanitize_branch_name(s: str) -> str:
+    s = re.sub(r"[^0-9A-Za-z_\-\/]+", "-", s).strip("-")
+    return s[:80] if len(s) > 80 else s
+
+
+# -----------------------------
+# App
+# -----------------------------
+st.set_page_config(page_title="Inhale inference (Git move)", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
-ALL_MODEL_DIRS = discover_model_dirs()
-
-# ensure discovered dirs exist
-for d in ALL_MODEL_DIRS.values():
-    _ensure_dir(d)
-
 with st.sidebar:
-    st.header("Model manager (optional)")
-    enable_manager = st.checkbox("Enable moving models between folders", value=False)
+    st.header("GitHub model manager (moves via PR)")
 
-    if enable_manager:
-        st.caption("Folders are auto-detected: any directory in repo root ending with '_models'.")
-        st.caption("Move .keras files (and matching config_*.json when found) between folders.")
+    st.caption("This creates a GitHub Pull Request that moves selected files between folders.")
+    st.text_input("Admin password", type="password", key="admin_pwd")
+    can_move = is_move_allowed()
 
-        folder_names = list(ALL_MODEL_DIRS.keys())
-        # Put selected_models first for convenience
-        folder_names = ["selected_models"] + [n for n in folder_names if n != "selected_models"]
-
-        src_folder_name = st.selectbox("Source folder", options=folder_names, index=0)
-        dst_folder_name = st.selectbox(
-            "Destination folder",
-            options=folder_names,
-            index=min(1, len(folder_names) - 1),
-        )
-
-        src_dir = ALL_MODEL_DIRS[src_folder_name]
-        dst_dir = ALL_MODEL_DIRS[dst_folder_name]
-
-        src_models = _scan_keras_in_dir(src_dir)
-        if not src_models:
-            st.info(f"No .keras files in {src_folder_name}.")
-        else:
-            to_move = st.multiselect(
-                "Select models to move",
-                options=src_models,
-                format_func=lambda p: _rel_to_app(p),
-            )
-
-            move_with_config = st.checkbox("Also move matching config_*.json (if found next to model)", value=True)
-
-            if st.button(
-                "Move selected",
-                type="primary",
-                disabled=(len(to_move) == 0 or src_folder_name == dst_folder_name),
-            ):
-                moved = []
-                failed = []
-                for mp in to_move:
-                    try:
-                        old_dir = os.path.dirname(os.path.abspath(mp))
-                        old_mp = mp
-
-                        # move model
-                        new_mp = _safe_move(old_mp, dst_dir)
-                        moved.append((_rel_to_app(old_mp), _rel_to_app(new_mp)))
-
-                        # move config (optional) — look in old location
-                        if move_with_config:
-                            cfg_old = _find_config_for_model(old_mp)
-                            if cfg_old and os.path.exists(cfg_old) and os.path.dirname(cfg_old) == old_dir:
-                                _safe_move(cfg_old, dst_dir)
-
-                    except Exception as e:
-                        failed.append(f"{_rel_to_app(mp)}: {type(e).__name__}: {e}")
-
-                # clear caches because file set changed
-                st.cache_resource.clear()
-                st.cache_data.clear()
-
-                if moved:
-                    st.success("Moved:\n" + "\n".join([f"{a}  ->  {b}" for a, b in moved]))
-                if failed:
-                    st.error("Failed:\n" + "\n".join(failed))
+    enable_manager = st.checkbox("Enable moving models between folders", value=False, disabled=(not can_move))
+    move_with_config = st.checkbox("Also move matching config_*.json", value=True, disabled=(not can_move))
 
     st.divider()
     st.header("Inference")
-    st.caption("Inference list shows ONLY selected_models/")
+    st.caption("Inference reads from local repo checkout (selected_models/)")
 
-    all_models = list_all_models_selected_only()
-    if not all_models:
-        st.error(f"No models found in '{_rel_to_app(SELECTED_MODELS_DIR)}'.")
+    # Local scan for inference (same as before)
+    selected_dir_local = os.path.join(APP_DIR, SELECTED_FOLDER)
+    if not os.path.isdir(selected_dir_local):
+        st.error(f"Folder not found locally: {selected_dir_local}")
+        st.stop()
+
+    # reuse your arch modules' list_models for local inference
+    all_models_local = []
+    for mod in ARCH_MODULES.values():
+        all_models_local.extend(mod.list_models(selected_dir_local))
+    all_models_local = sorted(set(all_models_local))
+
+    if not all_models_local:
+        st.error("No models found in local selected_models/")
         st.stop()
 
     chosen = st.multiselect(
         "Select up to 3 models",
-        options=all_models,
-        format_func=lambda p: os.path.relpath(p, SELECTED_MODELS_DIR),
+        options=all_models_local,
+        format_func=lambda p: os.path.relpath(p, selected_dir_local),
         max_selections=3,
     )
 
     st.header("Windowing")
-    hop_sec = st.number_input(
-        "Window hop (sec). Used only if 'Use hop = noise_length_sec' is OFF",
-        min_value=0.1,
-        value=5.0,
-        step=0.1,
-    )
+    hop_sec = st.number_input("Window hop (sec)", min_value=0.1, value=5.0, step=0.1)
     use_default_hop = st.checkbox("Use hop = noise_length_sec (per model)", value=True)
 
     st.header("Plot resolution")
-    max_plot_points = st.number_input(
-        "Max points per plot (controls downsampling, affects waveform & aligned predictions)",
-        min_value=2000,
-        max_value=200000,
-        value=20000,
-        step=1000,
-    )
+    max_plot_points = st.number_input("Max points per plot", min_value=2000, max_value=200000, value=20000, step=1000)
 
     st.header("Audio player")
-    show_player = st.checkbox("Show audio player for each uploaded file", value=True)
+    show_player = st.checkbox("Show audio player", value=True)
     autoplay = st.checkbox("Autoplay (browser-dependent)", value=False)
 
     st.header("Upload audio")
     uploads = st.file_uploader(
-        "Upload audio files (10+ is OK)",
+        "Upload audio files",
         type=["wav", "m4a", "mp3", "flac", "ogg"],
         accept_multiple_files=True,
     )
 
+# --- Git move UI (main area) ---
+if enable_manager and is_move_allowed():
+    store = get_github_store()
+    st.subheader("Move models in GitHub (creates PR)")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        src_folder = st.selectbox("Source folder", options=MODEL_FOLDERS, index=MODEL_FOLDERS.index("selected_models"))
+    with c2:
+        dst_folder = st.selectbox("Destination folder", options=MODEL_FOLDERS, index=MODEL_FOLDERS.index("tested_models"))
+
+    # List .keras in src folder on GitHub
+    # Using contents API requires exact paths, we do a lightweight approach:
+    # We'll rely on local file listing for selection UI and then operate on those names in GitHub.
+    # IMPORTANT: This means repo checkout must be up to date with GitHub.
+    src_local = os.path.join(APP_DIR, src_folder)
+    os.makedirs(src_local, exist_ok=True)
+    keras_local = sorted([p for p in glob.glob(os.path.join(src_local, "*.keras"))])
+
+    if not keras_local:
+        st.info(f"No .keras files found locally in {src_folder}/. (Ensure repo checkout contains files.)")
+    else:
+        selected_files = st.multiselect(
+            "Select .keras files to move",
+            options=keras_local,
+            format_func=lambda p: os.path.basename(p),
+        )
+
+        if st.button("Create PR to move selected", type="primary", disabled=(len(selected_files) == 0 or src_folder == dst_folder)):
+            # Create new branch
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            branch = _sanitize_branch_name(f"move-models/{src_folder}-to-{dst_folder}-{stamp}")
+            store.create_branch_from(store.cfg.branch, branch)
+
+            moved, failed = [], []
+            for local_path in selected_files:
+                base = os.path.basename(local_path)
+                src_path = f"{src_folder}/{base}"
+                dst_path = f"{dst_folder}/{base}"
+                try:
+                    store.move_file_via_branch(
+                        src_path=src_path,
+                        dst_path=dst_path,
+                        branch=branch,
+                        message_prefix="Move model",
+                        overwrite=False,
+                    )
+                    moved.append(f"{src_path} -> {dst_path}")
+
+                    if move_with_config:
+                        # try config_<tag>.json
+                        tag = base.replace(".keras", "")
+                        cfg_src = f"{src_folder}/config_{tag}.json"
+                        cfg_dst = f"{dst_folder}/config_{tag}.json"
+                        try:
+                            # If config exists, move it too
+                            _bytes, _sha = store.get_content(cfg_src, ref=branch)
+                            store.move_file_via_branch(
+                                src_path=cfg_src,
+                                dst_path=cfg_dst,
+                                branch=branch,
+                                message_prefix="Move config",
+                                overwrite=False,
+                            )
+                            moved.append(f"{cfg_src} -> {cfg_dst}")
+                        except Exception:
+                            # config may not exist — ignore
+                            pass
+
+                except Exception as e:
+                    failed.append(f"{src_path}: {type(e).__name__}: {e}")
+
+            if moved and not failed:
+                pr_url = store.create_pull_request(
+                    head_branch=branch,
+                    title=f"Move models: {src_folder} -> {dst_folder} ({stamp})",
+                    body="Automated move from Streamlit UI.\n\nFiles moved:\n- " + "\n- ".join(moved),
+                )
+                st.success("PR created: " + pr_url)
+            else:
+                st.error("Move result:\n\nMoved:\n" + "\n".join(moved) + "\n\nFailed:\n" + "\n".join(failed))
+
+    st.divider()
+
+# --- Inference ---
 if not chosen:
     st.info("Select 1–3 models in the sidebar.")
     st.stop()
@@ -365,16 +328,26 @@ if not uploads:
     st.stop()
 
 palette = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3", "C4"])
-chosen_names = [os.path.relpath(p, SELECTED_MODELS_DIR) for p in chosen]
+chosen_names = [os.path.relpath(p, os.path.join(APP_DIR, SELECTED_FOLDER)) for p in chosen]
 colors = {chosen_names[i]: palette[i % len(palette)] for i in range(len(chosen_names))}
 
-# load selected models
+# Load local models (same as your current architecture modules expect local paths)
+@st.cache_resource(show_spinner=False)
+def load_one_model_local(model_path: str):
+    for arch_name, mod in ARCH_MODULES.items():
+        if mod.can_handle_model(model_path):
+            model, cfg = mod.load_model_and_cfg(model_path)
+            return arch_name, model, cfg
+    raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
+
+
 bundle = {}
 errors = []
+selected_dir_local = os.path.join(APP_DIR, SELECTED_FOLDER)
 for p in chosen:
-    label = os.path.relpath(p, SELECTED_MODELS_DIR)
+    label = os.path.relpath(p, selected_dir_local)
     try:
-        arch_name, model, cfg = load_one_model(p)
+        arch_name, model, cfg = load_one_model_local(p)
         bundle[label] = (arch_name, model, cfg)
     except Exception as e:
         errors.append(f"{label}: {type(e).__name__}: {e}")
@@ -383,7 +356,6 @@ if errors:
     st.error("Some selected models failed to load:\n\n" + "\n".join(errors))
     st.stop()
 
-# run inference for each upload
 for up in uploads:
     audio_name = up.name
     suffix = os.path.splitext(audio_name)[1].lower()
@@ -412,9 +384,10 @@ for up in uploads:
 
     preds_by_model = {}
     for label, df in dfs_by_model.items():
-        dose = interpolate_predictions_to_grid(df, t_grid, "dose_smooth")
-        flow = interpolate_predictions_to_grid(df, t_grid, "flow_smooth")
-        preds_by_model[label] = {"dose": dose, "flow": flow}
+        preds_by_model[label] = {
+            "dose": interpolate_predictions_to_grid(df, t_grid, "dose_smooth"),
+            "flow": interpolate_predictions_to_grid(df, t_grid, "flow_smooth"),
+        }
 
     plot_waveform_and_predictions(
         t_grid=t_grid,
@@ -423,19 +396,3 @@ for up in uploads:
         colors=colors,
         title_prefix=audio_name,
     )
-
-    with st.expander("Selected models details"):
-        rows = []
-        for label, (arch_name, _m, cfg) in bundle.items():
-            rows.append({
-                "model": label,
-                "arch_group": arch_name,
-                "model_type": cfg.get("model_type"),
-                "feature_type": cfg.get("feature_type"),
-                "transform": cfg.get("transformation_method"),
-                "loss_type": cfg.get("loss_type"),
-                "sample_rate": cfg.get("sample_rate"),
-                "noise_length_sec": cfg.get("noise_length_sec"),
-                "frame_length_sec": cfg.get("frame_length_sec"),
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
