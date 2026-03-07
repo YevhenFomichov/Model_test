@@ -42,9 +42,6 @@ DEFAULT_INFERENCE_FOLDERS = MODEL_FOLDERS[:]
 REGISTRY_PATH = "model_registry.json"
 
 
-# -----------------------------
-# Audio + plotting helpers
-# -----------------------------
 @st.cache_data(show_spinner=False)
 def load_waveform(audio_bytes: bytes, suffix: str, sr: int = 44100) -> Tuple[int, np.ndarray]:
     x = arch_basic.load_audio_mono_from_bytes(audio_bytes, suffix, sr)
@@ -143,9 +140,6 @@ def _guess_streamlit_audio_mime(suffix: str) -> str:
     return "audio/*"
 
 
-# -----------------------------
-# GitHub store / registry
-# -----------------------------
 def get_github_store() -> GitHubRepoStore:
     gh = st.secrets.get("github", None)
     if gh is None:
@@ -183,7 +177,9 @@ def bootstrap_registry(store: GitHubRepoStore) -> dict:
     return {"version": 1, "models": models}
 
 
-def load_registry(store: GitHubRepoStore) -> dict:
+@st.cache_data(show_spinner=False)
+def load_registry_cached() -> dict:
+    store = get_github_store()
     if store.exists(REGISTRY_PATH):
         reg = store.read_json(REGISTRY_PATH)
         if "models" in reg:
@@ -191,8 +187,11 @@ def load_registry(store: GitHubRepoStore) -> dict:
     return bootstrap_registry(store)
 
 
-def save_registry(store: GitHubRepoStore, registry: dict, message: str):
+def save_registry(registry: dict, message: str):
+    store = get_github_store()
     store.write_json(REGISTRY_PATH, registry, message=message, branch=store.cfg.branch)
+    st.cache_data.clear()
+    st.cache_resource.clear()
 
 
 def get_models_by_categories(registry: dict, categories: List[str]) -> List[str]:
@@ -203,9 +202,6 @@ def get_models_by_categories(registry: dict, categories: List[str]) -> List[str]
     return sorted(set(out))
 
 
-# -----------------------------
-# Remote cache
-# -----------------------------
 def _cache_subdir_for_key(model_key: str) -> str:
     h = hashlib.sha1(model_key.encode("utf-8")).hexdigest()[:12]
     return os.path.join(REMOTE_CACHE_DIR, h)
@@ -240,13 +236,10 @@ def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str, registry:
     return local_model_path
 
 
-# -----------------------------
-# Loading models
-# -----------------------------
 @st.cache_resource(show_spinner=False)
 def load_one_model_from_registry_key(model_key: str):
     store = get_github_store()
-    registry = load_registry(store)
+    registry = load_registry_cached()
     local_model_path = ensure_remote_model_cached(store, model_key, registry)
 
     for arch_name, mod in ARCH_MODULES.items():
@@ -263,14 +256,10 @@ def display_label_for_model(model_key: str) -> str:
     return os.path.basename(model_key)
 
 
-# -----------------------------
-# App
-# -----------------------------
 st.set_page_config(page_title="Inhale inference + safe logical moving", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
-store = get_github_store()
-registry = load_registry(store)
+registry = load_registry_cached()
 
 with st.sidebar:
     st.header("Model manager (safe logical moving)")
@@ -343,9 +332,6 @@ with st.sidebar:
         accept_multiple_files=True,
     )
 
-# -----------------------------
-# Logical move UI
-# -----------------------------
 if enable_manager and can_move:
     st.subheader("Move models between categories safely")
 
@@ -385,19 +371,14 @@ if enable_manager and can_move:
                 registry["models"][model_key]["category"] = dst_folder
 
             save_registry(
-                store,
                 registry,
                 message=f"Update model categories: {src_folder} -> {dst_folder}",
             )
 
-            st.cache_resource.clear()
             st.success("Categories updated safely in model_registry.json")
 
     st.divider()
 
-# -----------------------------
-# Inference
-# -----------------------------
 if not chosen:
     st.info("Select 1–3 models in the sidebar.")
     st.stop()
