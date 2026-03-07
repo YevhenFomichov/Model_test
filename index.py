@@ -42,6 +42,9 @@ DEFAULT_INFERENCE_FOLDERS = MODEL_FOLDERS[:]
 REGISTRY_PATH = "model_registry.json"
 
 
+# -----------------------------
+# Audio + plotting helpers
+# -----------------------------
 @st.cache_data(show_spinner=False)
 def load_waveform(audio_bytes: bytes, suffix: str, sr: int = 44100) -> Tuple[int, np.ndarray]:
     x = arch_basic.load_audio_mono_from_bytes(audio_bytes, suffix, sr)
@@ -140,6 +143,9 @@ def _guess_streamlit_audio_mime(suffix: str) -> str:
     return "audio/*"
 
 
+# -----------------------------
+# GitHub store / registry
+# -----------------------------
 def get_github_store() -> GitHubRepoStore:
     gh = st.secrets.get("github", None)
     if gh is None:
@@ -178,7 +184,7 @@ def bootstrap_registry(store: GitHubRepoStore) -> dict:
 
 
 @st.cache_data(show_spinner=False)
-def load_registry_cached() -> dict:
+def load_registry_from_remote() -> dict:
     store = get_github_store()
     if store.exists(REGISTRY_PATH):
         reg = store.read_json(REGISTRY_PATH)
@@ -187,11 +193,25 @@ def load_registry_cached() -> dict:
     return bootstrap_registry(store)
 
 
+def get_registry() -> dict:
+    if "model_registry" not in st.session_state:
+        st.session_state["model_registry"] = load_registry_from_remote()
+    return st.session_state["model_registry"]
+
+
 def save_registry(registry: dict, message: str):
     store = get_github_store()
     store.write_json(REGISTRY_PATH, registry, message=message, branch=store.cfg.branch)
+
+    st.session_state["model_registry"] = registry
     st.cache_data.clear()
     st.cache_resource.clear()
+
+
+def refresh_registry_from_remote():
+    st.cache_data.clear()
+    st.cache_resource.clear()
+    st.session_state["model_registry"] = load_registry_from_remote()
 
 
 def get_models_by_categories(registry: dict, categories: List[str]) -> List[str]:
@@ -202,6 +222,9 @@ def get_models_by_categories(registry: dict, categories: List[str]) -> List[str]
     return sorted(set(out))
 
 
+# -----------------------------
+# Remote cache
+# -----------------------------
 def _cache_subdir_for_key(model_key: str) -> str:
     h = hashlib.sha1(model_key.encode("utf-8")).hexdigest()[:12]
     return os.path.join(REMOTE_CACHE_DIR, h)
@@ -236,10 +259,13 @@ def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str, registry:
     return local_model_path
 
 
+# -----------------------------
+# Loading models
+# -----------------------------
 @st.cache_resource(show_spinner=False)
 def load_one_model_from_registry_key(model_key: str):
     store = get_github_store()
-    registry = load_registry_cached()
+    registry = get_registry()
     local_model_path = ensure_remote_model_cached(store, model_key, registry)
 
     for arch_name, mod in ARCH_MODULES.items():
@@ -256,10 +282,13 @@ def display_label_for_model(model_key: str) -> str:
     return os.path.basename(model_key)
 
 
+# -----------------------------
+# App
+# -----------------------------
 st.set_page_config(page_title="Inhale inference + safe logical moving", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
-registry = load_registry_cached()
+registry = get_registry()
 
 with st.sidebar:
     st.header("Model manager (safe logical moving)")
@@ -285,15 +314,20 @@ with st.sidebar:
         "Enable moving models between categories",
         value=False,
         disabled=(not can_move),
+        key="enable_manager",
     )
 
     st.divider()
     st.header("Inference")
 
+    if "inference_folders" not in st.session_state:
+        st.session_state["inference_folders"] = DEFAULT_INFERENCE_FOLDERS[:]
+
     inference_folders = st.multiselect(
         "Categories used for model testing",
         options=MODEL_FOLDERS,
-        default=DEFAULT_INFERENCE_FOLDERS,
+        default=st.session_state["inference_folders"],
+        key="inference_folders",
     )
 
     all_models = get_models_by_categories(registry, inference_folders)
@@ -306,6 +340,7 @@ with st.sidebar:
         options=all_models,
         format_func=display_label_for_model,
         max_selections=3,
+        key="chosen_models",
     )
 
     st.header("Windowing")
@@ -360,20 +395,37 @@ if enable_manager and can_move:
             "Select models to move",
             options=src_models,
             format_func=lambda k: os.path.basename(k),
+            key="move_selected_files",
         )
 
         if st.button(
             "Move selected safely",
             type="primary",
             disabled=(len(selected_files) == 0 or src_folder == dst_folder),
+            key="move_selected_button",
         ):
+            new_registry = {
+                "version": registry.get("version", 1),
+                "models": {k: dict(v) for k, v in registry["models"].items()},
+            }
+
             for model_key in selected_files:
-                registry["models"][model_key]["category"] = dst_folder
+                new_registry["models"][model_key]["category"] = dst_folder
 
             save_registry(
-                registry,
+                new_registry,
                 message=f"Update model categories: {src_folder} -> {dst_folder}",
             )
+
+            # reset widget selections so UI rebuilds cleanly
+            st.session_state["chosen_models"] = []
+            st.session_state["move_selected_files"] = []
+
+            # optional: if user filtered only by source category, auto-add destination too
+            current_folders = list(st.session_state.get("inference_folders", []))
+            if dst_folder not in current_folders:
+                current_folders.append(dst_folder)
+                st.session_state["inference_folders"] = current_folders
 
             st.success("Categories updated safely in model_registry.json")
             st.rerun()
