@@ -376,6 +376,7 @@ if enable_manager and can_move:
             )
 
             st.success("Categories updated safely in model_registry.json")
+            st.rerun()
 
     st.divider()
 
