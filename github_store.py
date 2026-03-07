@@ -17,8 +17,8 @@ class GitHubRepoStore:
     """
     GitHub API wrapper for:
     - listing files from repo tree
-    - downloading file bytes
-    - detecting Git LFS pointer files
+    - downloading file bytes via Contents API metadata/download_url
+    - falling back to git blob download when appropriate
     - moving file by copy+delete (direct commit to main)
     """
 
@@ -38,10 +38,6 @@ class GitHubRepoStore:
 
     def _repo_path(self) -> str:
         return f"/repos/{self.cfg.owner}/{self.cfg.repo}"
-
-    def _raw_url(self, path: str, branch: Optional[str] = None) -> str:
-        br = branch or self.cfg.branch
-        return f"https://raw.githubusercontent.com/{self.cfg.owner}/{self.cfg.repo}/{br}/{path}"
 
     def get_ref_sha(self, branch: Optional[str] = None) -> str:
         br = branch or self.cfg.branch
@@ -113,37 +109,16 @@ class GitHubRepoStore:
     def is_lfs_pointer_bytes(self, content: bytes) -> bool:
         return content.startswith(self.LFS_POINTER_PREFIX)
 
-    def get_raw_content(self, path: str, ref: Optional[str] = None) -> bytes:
-        """
-        1) Read git blob bytes.
-        2) If blob is a Git LFS pointer, fallback to raw.githubusercontent URL.
-        3) Otherwise return blob bytes directly.
-        """
-        blob_sha = self.get_blob_sha(path, branch=ref)
-        blob_bytes = self.get_blob_bytes(blob_sha)
+    def looks_like_html_or_json_error(self, content: bytes) -> bool:
+        head = content[:200].lstrip()
+        return (
+            head.startswith(b"<!DOCTYPE html")
+            or head.startswith(b"<html")
+            or head.startswith(b"{")
+            or head.startswith(b"[")
+        )
 
-        if self.is_lfs_pointer_bytes(blob_bytes):
-            raw_url = self._raw_url(path, branch=ref)
-
-            # For public repos this usually works directly.
-            # For private repos raw.githubusercontent may ignore Authorization,
-            # so we try both with and without headers.
-            r = requests.get(raw_url, timeout=300)
-            if r.status_code == 200 and r.content and not self.is_lfs_pointer_bytes(r.content):
-                return r.content
-
-            r = requests.get(raw_url, headers={"Authorization": f"Bearer {self.cfg.token}"}, timeout=300)
-            r.raise_for_status()
-            if self.is_lfs_pointer_bytes(r.content):
-                raise ValueError(
-                    f"Git LFS pointer was downloaded instead of actual file for: {path}. "
-                    f"The model appears to be stored via Git LFS and raw download did not resolve the object."
-                )
-            return r.content
-
-        return blob_bytes
-
-    def get_file_sha(self, path: str, ref: Optional[str] = None) -> str:
+    def get_file_metadata(self, path: str, ref: Optional[str] = None) -> dict:
         params = {}
         if ref:
             params["ref"] = ref
@@ -158,14 +133,52 @@ class GitHubRepoStore:
         j = r.json()
         if j.get("type") != "file":
             raise ValueError(f"Not a file: {path}")
-        return j["sha"]
+        return j
+
+    def get_file_sha(self, path: str, ref: Optional[str] = None) -> str:
+        return self.get_file_metadata(path, ref=ref)["sha"]
 
     def exists(self, path: str, ref: Optional[str] = None) -> bool:
         try:
-            self.get_blob_sha(path, branch=ref)
+            self.get_file_metadata(path, ref=ref)
             return True
-        except FileNotFoundError:
-            return False
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return False
+            raise
+
+    def _download_via_download_url(self, download_url: str) -> bytes:
+        # download_url is intended for direct file download
+        r = requests.get(download_url, timeout=300)
+        r.raise_for_status()
+        return r.content
+
+    def get_raw_content(self, path: str, ref: Optional[str] = None) -> bytes:
+        """
+        Preferred order:
+        1) Contents API metadata -> download_url -> bytes
+        2) If that yields invalid/pointer-ish content, fallback to git blob bytes
+        """
+        meta = self.get_file_metadata(path, ref=ref)
+        download_url = meta.get("download_url")
+
+        if download_url:
+            data = self._download_via_download_url(download_url)
+            if data and (not self.is_lfs_pointer_bytes(data)) and (not self.looks_like_html_or_json_error(data)):
+                return data
+
+        # Fallback: direct git blob
+        blob_sha = self.get_blob_sha(path, branch=ref)
+        blob_bytes = self.get_blob_bytes(blob_sha)
+
+        # If blob is LFS pointer, then this file is stored via LFS and download_url did not resolve actual bytes
+        if self.is_lfs_pointer_bytes(blob_bytes):
+            raise ValueError(
+                f"GitHub returned a Git LFS pointer instead of the actual file for: {path}. "
+                f"This usually means the file is stored in LFS and direct API download did not resolve the object."
+            )
+
+        return blob_bytes
 
     def put_content(
         self,
