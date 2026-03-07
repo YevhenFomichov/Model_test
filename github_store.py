@@ -1,4 +1,4 @@
-import base64
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -16,11 +16,10 @@ class GitHubConfig:
 class GitHubRepoStore:
     """
     GitHub API wrapper for:
-    - reading file content
-    - creating/updating files
-    - deleting files
-    - moving file by copy+delete
     - listing files from repo tree
+    - downloading raw file bytes
+    - checking file existence
+    - moving file by copy+delete (direct commit to main)
     """
 
     def __init__(self, cfg: GitHubConfig):
@@ -29,6 +28,11 @@ class GitHubRepoStore:
         self.headers = {
             "Authorization": f"Bearer {cfg.token}",
             "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        self.raw_headers = {
+            "Authorization": f"Bearer {cfg.token}",
+            "Accept": "application/vnd.github.raw",
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
@@ -49,11 +53,6 @@ class GitHubRepoStore:
         return r.json()["object"]["sha"]
 
     def list_files(self, prefix: Optional[str] = None, suffix: Optional[str] = None, branch: Optional[str] = None) -> List[str]:
-        """
-        List files from repository tree recursively.
-        Returns repo-relative paths like:
-          selected_models/basic_raw_None_mse.keras
-        """
         sha = self.get_ref_sha(branch)
         r = requests.get(
             self._url(self._repo_path() + f"/git/trees/{sha}?recursive=1"),
@@ -75,7 +74,25 @@ class GitHubRepoStore:
             out.append(path)
         return sorted(out)
 
-    def get_content(self, path: str, ref: Optional[str] = None) -> Tuple[bytes, str]:
+    def get_raw_content(self, path: str, ref: Optional[str] = None) -> bytes:
+        """
+        Download raw bytes of a file from GitHub contents API.
+        This is safer for binary .keras files than base64 JSON contents.
+        """
+        params = {}
+        if ref:
+            params["ref"] = ref
+
+        r = requests.get(
+            self._url(self._repo_path() + f"/contents/{path}"),
+            headers=self.raw_headers,
+            params=params,
+            timeout=120,
+        )
+        r.raise_for_status()
+        return r.content
+
+    def get_file_sha(self, path: str, ref: Optional[str] = None) -> str:
         params = {}
         if ref:
             params["ref"] = ref
@@ -88,14 +105,18 @@ class GitHubRepoStore:
         )
         r.raise_for_status()
         j = r.json()
-
         if j.get("type") != "file":
             raise ValueError(f"Not a file: {path}")
+        return j["sha"]
 
-        content_b64 = j["content"]
-        sha = j["sha"]
-        raw = base64.b64decode(content_b64)
-        return raw, sha
+    def exists(self, path: str, ref: Optional[str] = None) -> bool:
+        try:
+            self.get_file_sha(path, ref=ref)
+            return True
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                return False
+            raise
 
     def put_content(
         self,
@@ -105,6 +126,8 @@ class GitHubRepoStore:
         branch: Optional[str] = None,
         sha: Optional[str] = None,
     ):
+        import base64
+
         payload = {
             "message": message,
             "content": base64.b64encode(content_bytes).decode("utf-8"),
@@ -117,7 +140,7 @@ class GitHubRepoStore:
             self._url(self._repo_path() + f"/contents/{path}"),
             headers=self.headers,
             json=payload,
-            timeout=60,
+            timeout=120,
         )
         r.raise_for_status()
         return r.json()
@@ -138,19 +161,10 @@ class GitHubRepoStore:
             self._url(self._repo_path() + f"/contents/{path}"),
             headers=self.headers,
             json=payload,
-            timeout=60,
+            timeout=120,
         )
         r.raise_for_status()
         return r.json()
-
-    def exists(self, path: str, ref: Optional[str] = None) -> bool:
-        try:
-            self.get_content(path, ref=ref)
-            return True
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                return False
-            raise
 
     def move_file(
         self,
@@ -162,13 +176,14 @@ class GitHubRepoStore:
     ):
         branch = branch or self.cfg.branch
 
-        src_bytes, src_sha = self.get_content(src_path, ref=branch)
+        src_bytes = self.get_raw_content(src_path, ref=branch)
+        src_sha = self.get_file_sha(src_path, ref=branch)
 
         dst_sha = None
         if self.exists(dst_path, ref=branch):
             if not overwrite:
                 raise FileExistsError(f"Destination exists: {dst_path}")
-            _, dst_sha = self.get_content(dst_path, ref=branch)
+            dst_sha = self.get_file_sha(dst_path, ref=branch)
 
         self.put_content(
             dst_path,
