@@ -1,6 +1,6 @@
 import base64
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import requests
 
@@ -15,11 +15,12 @@ class GitHubConfig:
 
 class GitHubRepoStore:
     """
-    Minimal GitHub API wrapper for:
+    GitHub API wrapper for:
     - reading file content
     - creating/updating files
     - deleting files
     - moving file by copy+delete
+    - listing files from repo tree
     """
 
     def __init__(self, cfg: GitHubConfig):
@@ -36,6 +37,43 @@ class GitHubRepoStore:
 
     def _repo_path(self) -> str:
         return f"/repos/{self.cfg.owner}/{self.cfg.repo}"
+
+    def get_ref_sha(self, branch: Optional[str] = None) -> str:
+        br = branch or self.cfg.branch
+        r = requests.get(
+            self._url(self._repo_path() + f"/git/ref/heads/{br}"),
+            headers=self.headers,
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()["object"]["sha"]
+
+    def list_files(self, prefix: Optional[str] = None, suffix: Optional[str] = None, branch: Optional[str] = None) -> List[str]:
+        """
+        List files from repository tree recursively.
+        Returns repo-relative paths like:
+          selected_models/basic_raw_None_mse.keras
+        """
+        sha = self.get_ref_sha(branch)
+        r = requests.get(
+            self._url(self._repo_path() + f"/git/trees/{sha}?recursive=1"),
+            headers=self.headers,
+            timeout=60,
+        )
+        r.raise_for_status()
+        tree = r.json().get("tree", [])
+
+        out = []
+        for item in tree:
+            if item.get("type") != "blob":
+                continue
+            path = item.get("path", "")
+            if prefix and not path.startswith(prefix):
+                continue
+            if suffix and not path.endswith(suffix):
+                continue
+            out.append(path)
+        return sorted(out)
 
     def get_content(self, path: str, ref: Optional[str] = None) -> Tuple[bytes, str]:
         params = {}
