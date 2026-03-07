@@ -217,7 +217,7 @@
       "physical_path": "selected_models/cnn2d_resnet_td_spec_stats_standardize_weighted_mse.keras"
     },
     "selected_models/cnn_lstm_logmel_None_huber.keras": {
-      "category": "selected_models",
+      "category": "tested_models",
       "json_path": "selected_models/cnn_lstm_logmel_None_huber.json",
       "name": "cnn_lstm_logmel_None_huber.keras",
       "physical_path": "selected_models/cnn_lstm_logmel_None_huber.keras"
