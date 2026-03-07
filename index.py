@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -16,6 +17,8 @@ import arch_transformer
 from github_store import GitHubConfig, GitHubRepoStore
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+REMOTE_CACHE_DIR = os.path.join(APP_DIR, ".remote_model_cache")
+os.makedirs(REMOTE_CACHE_DIR, exist_ok=True)
 
 ARCH_MODULES = {
     "basic": arch_basic,
@@ -158,46 +161,70 @@ def get_github_store() -> GitHubRepoStore:
 
 
 # -----------------------------
-# Config/json matching
+# Matching json + remote cache
 # -----------------------------
-def resolve_json_path_for_model(local_model_path: str) -> Optional[str]:
+def remote_json_key_for_model_key(model_key: str) -> str:
+    return model_key.replace(".keras", ".json")
+
+
+def _cache_subdir_for_key(model_key: str) -> str:
+    h = hashlib.sha1(model_key.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(REMOTE_CACHE_DIR, h)
+
+
+def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str) -> str:
     """
-    Exact matching json:
-      /folder/model_tag.keras -> /folder/model_tag.json
+    Download GitHub model + matching json into local cache directory.
+    Returns local path to .keras model.
     """
-    d = os.path.dirname(os.path.abspath(local_model_path))
-    tag = os.path.basename(local_model_path).replace(".keras", "")
-    js = os.path.join(d, f"{tag}.json")
-    return js if os.path.exists(js) else None
+    cache_dir = _cache_subdir_for_key(model_key)
+    os.makedirs(cache_dir, exist_ok=True)
+
+    model_name = os.path.basename(model_key)
+    local_model_path = os.path.join(cache_dir, model_name)
+
+    model_bytes, _ = store.get_content(model_key)
+    with open(local_model_path, "wb") as f:
+        f.write(model_bytes)
+
+    json_key = remote_json_key_for_model_key(model_key)
+    if store.exists(json_key):
+        json_name = os.path.basename(json_key)
+        local_json_path = os.path.join(cache_dir, json_name)
+        json_bytes, _ = store.get_content(json_key)
+        with open(local_json_path, "wb") as f:
+            f.write(json_bytes)
+
+    return local_model_path
 
 
 # -----------------------------
-# Local inference model loading
+# Remote listing + local loading
 # -----------------------------
-def scan_local_models_from_folders(folders: List[str]) -> List[str]:
+def scan_remote_models_from_folders(store: GitHubRepoStore, folders: List[str]) -> List[str]:
     out = []
     for folder in folders:
-        folder_abs = os.path.join(APP_DIR, folder)
-        if not os.path.isdir(folder_abs):
-            continue
-        pattern = os.path.join(folder_abs, "**", "*.keras")
-        out.extend(glob.glob(pattern, recursive=True))
+        prefix = f"{folder}/"
+        out.extend(store.list_files(prefix=prefix, suffix=".keras"))
     return sorted(set(out))
 
 
 @st.cache_resource(show_spinner=False)
-def load_one_model_local(model_path: str):
+def load_one_model_from_remote_key(model_key: str):
+    store = get_github_store()
+    local_model_path = ensure_remote_model_cached(store, model_key)
+
     for arch_name, mod in ARCH_MODULES.items():
-        if hasattr(mod, "can_handle_model") and mod.can_handle_model(model_path):
+        if hasattr(mod, "can_handle_model") and mod.can_handle_model(local_model_path):
             if not hasattr(mod, "load_model_and_cfg"):
                 raise AttributeError(f"Module {mod.__name__} has no load_model_and_cfg")
-            model, cfg = mod.load_model_and_cfg(model_path)
+            model, cfg = mod.load_model_and_cfg(local_model_path)
             return arch_name, model, cfg
-    raise ValueError(f"No architecture handler found for: {os.path.basename(model_path)}")
+    raise ValueError(f"No architecture handler found for: {os.path.basename(model_key)}")
 
 
-def display_label_for_model(model_path: str) -> str:
-    return os.path.basename(model_path)
+def display_label_for_model(model_key: str) -> str:
+    return os.path.basename(model_key)
 
 
 # -----------------------------
@@ -205,6 +232,8 @@ def display_label_for_model(model_path: str) -> str:
 # -----------------------------
 st.set_page_config(page_title="Inhale inference + GitHub main commits", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
+
+store = get_github_store()
 
 with st.sidebar:
     st.header("GitHub model manager (direct commit to main)")
@@ -247,14 +276,14 @@ with st.sidebar:
         default=DEFAULT_INFERENCE_FOLDERS,
     )
 
-    all_models_local = scan_local_models_from_folders(inference_folders)
-    if not all_models_local:
+    all_models_remote = scan_remote_models_from_folders(store, inference_folders)
+    if not all_models_remote:
         st.error("No models found in selected inference folders.")
         st.stop()
 
     chosen = st.multiselect(
         "Select up to 3 models",
-        options=all_models_local,
+        options=all_models_remote,
         format_func=display_label_for_model,
         max_selections=3,
     )
@@ -287,8 +316,6 @@ with st.sidebar:
 # Direct GitHub move UI
 # -----------------------------
 if enable_manager and can_move:
-    store = get_github_store()
-
     st.subheader("Move models in GitHub (direct commit to main)")
 
     c1, c2 = st.columns(2)
@@ -307,17 +334,15 @@ if enable_manager and can_move:
             key="dst_folder",
         )
 
-    src_local = os.path.join(APP_DIR, src_folder)
-    os.makedirs(src_local, exist_ok=True)
-    keras_local = sorted(glob.glob(os.path.join(src_local, "*.keras")))
+    src_models_remote = scan_remote_models_from_folders(store, [src_folder])
 
-    if not keras_local:
-        st.info(f"No .keras files found locally in {src_folder}/")
+    if not src_models_remote:
+        st.info(f"No .keras files found in {src_folder}/ on GitHub")
     else:
         selected_files = st.multiselect(
             "Select .keras files to move",
-            options=keras_local,
-            format_func=lambda p: os.path.basename(p),
+            options=src_models_remote,
+            format_func=lambda k: os.path.basename(k),
         )
 
         if st.button(
@@ -328,38 +353,37 @@ if enable_manager and can_move:
             moved = []
             failed = []
 
-            for local_path in selected_files:
-                base = os.path.basename(local_path)
-                src_path = f"{src_folder}/{base}"
-                dst_path = f"{dst_folder}/{base}"
+            for model_key in selected_files:
+                base = os.path.basename(model_key)
+                dst_key = f"{dst_folder}/{base}"
 
                 try:
                     store.move_file(
-                        src_path=src_path,
-                        dst_path=dst_path,
+                        src_path=model_key,
+                        dst_path=dst_key,
                         message_prefix=f"Move model {base}",
                         branch=store.cfg.branch,
                         overwrite=False,
                     )
-                    moved.append(f"{base}")
+                    moved.append(base)
 
                     if move_with_json:
-                        js_local = resolve_json_path_for_model(local_path)
-                        if js_local:
-                            js_base = os.path.basename(js_local)
-                            js_src = f"{src_folder}/{js_base}"
-                            js_dst = f"{dst_folder}/{js_base}"
-
+                        json_key = remote_json_key_for_model_key(model_key)
+                        if store.exists(json_key):
+                            json_base = os.path.basename(json_key)
+                            dst_json_key = f"{dst_folder}/{json_base}"
                             store.move_file(
-                                src_path=js_src,
-                                dst_path=js_dst,
-                                message_prefix=f"Move json {js_base}",
+                                src_path=json_key,
+                                dst_path=dst_json_key,
+                                message_prefix=f"Move json {json_base}",
                                 branch=store.cfg.branch,
                                 overwrite=False,
                             )
 
                 except Exception as e:
                     failed.append(f"{base}: {type(e).__name__}: {e}")
+
+            st.cache_resource.clear()
 
             if moved:
                 st.success("Committed to main:\n" + "\n".join(moved))
@@ -380,15 +404,15 @@ if not uploads:
     st.stop()
 
 palette = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3", "C4"])
-chosen_names = [display_label_for_model(p) for p in chosen]
+chosen_names = [display_label_for_model(k) for k in chosen]
 colors = {chosen_names[i]: palette[i % len(palette)] for i in range(len(chosen_names))}
 
 bundle = {}
 errors = []
-for p in chosen:
-    label = display_label_for_model(p)
+for model_key in chosen:
+    label = display_label_for_model(model_key)
     try:
-        arch_name, model, cfg = load_one_model_local(p)
+        arch_name, model, cfg = load_one_model_from_remote_key(model_key)
         bundle[label] = (arch_name, model, cfg)
     except Exception as e:
         errors.append(f"{label}: {type(e).__name__}: {e}")
