@@ -1,6 +1,6 @@
-import os
+import base64
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import requests
 
@@ -17,7 +17,7 @@ class GitHubRepoStore:
     """
     GitHub API wrapper for:
     - listing files from repo tree
-    - downloading raw file bytes
+    - downloading exact blob bytes through Git Blobs API
     - checking file existence
     - moving file by copy+delete (direct commit to main)
     """
@@ -28,11 +28,6 @@ class GitHubRepoStore:
         self.headers = {
             "Authorization": f"Bearer {cfg.token}",
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-        self.raw_headers = {
-            "Authorization": f"Bearer {cfg.token}",
-            "Accept": "application/vnd.github.raw",
             "X-GitHub-Api-Version": "2022-11-28",
         }
 
@@ -52,7 +47,7 @@ class GitHubRepoStore:
         r.raise_for_status()
         return r.json()["object"]["sha"]
 
-    def list_files(self, prefix: Optional[str] = None, suffix: Optional[str] = None, branch: Optional[str] = None) -> List[str]:
+    def get_tree(self, branch: Optional[str] = None) -> List[dict]:
         sha = self.get_ref_sha(branch)
         r = requests.get(
             self._url(self._repo_path() + f"/git/trees/{sha}?recursive=1"),
@@ -60,8 +55,10 @@ class GitHubRepoStore:
             timeout=60,
         )
         r.raise_for_status()
-        tree = r.json().get("tree", [])
+        return r.json().get("tree", [])
 
+    def list_files(self, prefix: Optional[str] = None, suffix: Optional[str] = None, branch: Optional[str] = None) -> List[str]:
+        tree = self.get_tree(branch)
         out = []
         for item in tree:
             if item.get("type") != "blob":
@@ -74,25 +71,54 @@ class GitHubRepoStore:
             out.append(path)
         return sorted(out)
 
-    def get_raw_content(self, path: str, ref: Optional[str] = None) -> bytes:
-        """
-        Download raw bytes of a file from GitHub contents API.
-        This is safer for binary .keras files than base64 JSON contents.
-        """
-        params = {}
-        if ref:
-            params["ref"] = ref
+    def path_to_blob_sha_map(self, branch: Optional[str] = None) -> Dict[str, str]:
+        tree = self.get_tree(branch)
+        out: Dict[str, str] = {}
+        for item in tree:
+            if item.get("type") != "blob":
+                continue
+            path = item.get("path", "")
+            sha = item.get("sha", "")
+            if path and sha:
+                out[path] = sha
+        return out
 
+    def get_blob_sha(self, path: str, branch: Optional[str] = None) -> str:
+        mapping = self.path_to_blob_sha_map(branch)
+        if path not in mapping:
+            raise FileNotFoundError(f"Path not found in repo tree: {path}")
+        return mapping[path]
+
+    def get_blob_bytes(self, blob_sha: str) -> bytes:
+        """
+        Downloads exact blob content using Git Blobs API.
+        This is reliable for binary .keras files.
+        """
         r = requests.get(
-            self._url(self._repo_path() + f"/contents/{path}"),
-            headers=self.raw_headers,
-            params=params,
+            self._url(self._repo_path() + f"/git/blobs/{blob_sha}"),
+            headers=self.headers,
             timeout=120,
         )
         r.raise_for_status()
-        return r.content
+        j = r.json()
+
+        if j.get("encoding") != "base64":
+            raise ValueError(f"Unexpected blob encoding for sha={blob_sha}: {j.get('encoding')}")
+
+        content_b64 = j.get("content", "").replace("\n", "")
+        return base64.b64decode(content_b64)
+
+    def get_raw_content(self, path: str, ref: Optional[str] = None) -> bytes:
+        """
+        Resolve path -> blob sha -> exact bytes.
+        """
+        blob_sha = self.get_blob_sha(path, branch=ref)
+        return self.get_blob_bytes(blob_sha)
 
     def get_file_sha(self, path: str, ref: Optional[str] = None) -> str:
+        """
+        This is the contents/file SHA used by GitHub Contents API for delete/update.
+        """
         params = {}
         if ref:
             params["ref"] = ref
@@ -111,12 +137,10 @@ class GitHubRepoStore:
 
     def exists(self, path: str, ref: Optional[str] = None) -> bool:
         try:
-            self.get_file_sha(path, ref=ref)
+            self.get_blob_sha(path, branch=ref)
             return True
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                return False
-            raise
+        except FileNotFoundError:
+            return False
 
     def put_content(
         self,
@@ -126,8 +150,6 @@ class GitHubRepoStore:
         branch: Optional[str] = None,
         sha: Optional[str] = None,
     ):
-        import base64
-
         payload = {
             "message": message,
             "content": base64.b64encode(content_bytes).decode("utf-8"),
