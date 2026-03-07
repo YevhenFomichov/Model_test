@@ -73,7 +73,7 @@
       "physical_path": "selected_models/basic_logmel_standardize_weighted_mse.keras"
     },
     "selected_models/basic_raw_None_huber.keras": {
-      "category": "tested_models",
+      "category": "selected_models",
       "json_path": "selected_models/basic_raw_None_huber.json",
       "name": "basic_raw_None_huber.keras",
       "physical_path": "selected_models/basic_raw_None_huber.keras"
