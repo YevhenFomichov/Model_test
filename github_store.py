@@ -68,6 +68,7 @@ class GitHubRepoStore:
         params = {}
         if ref:
             params["ref"] = ref
+
         r = requests.get(
             self._url(self._repo_path() + f"/contents/{path}"),
             headers=self.headers,
@@ -127,15 +128,12 @@ class GitHubRepoStore:
         r.raise_for_status()
         return r.json()
 
-    def read_json_file(self, path: str, ref: Optional[str] = None) -> Dict:
-        if not self.exists(path, ref=ref):
-            return {}
-        raw = self.get_raw_content(path, ref=ref)
-        if not raw:
-            return {}
-        return json.loads(raw.decode("utf-8"))
-
-    def write_json_file(self, path: str, obj: Dict, message: str, branch: Optional[str] = None):
+    def write_json(self, path: str, obj: dict, message: str, branch: Optional[str] = None):
+        branch = branch or self.cfg.branch
         sha = self.get_file_sha(path, ref=branch) if self.exists(path, ref=branch) else None
-        raw = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
-        self.put_content(path, raw, message=message, branch=branch, sha=sha)
+        payload = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        return self.put_content(path=path, content_bytes=payload, message=message, branch=branch, sha=sha)
+
+    def read_json(self, path: str, ref: Optional[str] = None) -> dict:
+        raw = self.get_raw_content(path, ref=ref)
+        return json.loads(raw.decode("utf-8"))
