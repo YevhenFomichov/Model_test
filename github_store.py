@@ -50,7 +50,12 @@ class GitHubRepoStore:
         r.raise_for_status()
         return r.json().get("tree", [])
 
-    def list_files(self, prefix: Optional[str] = None, suffix: Optional[str] = None, branch: Optional[str] = None) -> List[str]:
+    def list_files(
+        self,
+        prefix: Optional[str] = None,
+        suffix: Optional[str] = None,
+        branch: Optional[str] = None,
+    ) -> List[str]:
         tree = self.get_tree(branch)
         out = []
         for item in tree:
@@ -98,7 +103,6 @@ class GitHubRepoStore:
         download_url = meta.get("download_url")
         if not download_url:
             raise ValueError(f"No download_url for file: {path}")
-
         r = requests.get(download_url, timeout=300)
         r.raise_for_status()
         return r.content
