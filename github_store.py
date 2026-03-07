@@ -17,10 +17,12 @@ class GitHubRepoStore:
     """
     GitHub API wrapper for:
     - listing files from repo tree
-    - downloading exact blob bytes through Git Blobs API
-    - checking file existence
+    - downloading file bytes
+    - detecting Git LFS pointer files
     - moving file by copy+delete (direct commit to main)
     """
+
+    LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1"
 
     def __init__(self, cfg: GitHubConfig):
         self.cfg = cfg
@@ -36,6 +38,10 @@ class GitHubRepoStore:
 
     def _repo_path(self) -> str:
         return f"/repos/{self.cfg.owner}/{self.cfg.repo}"
+
+    def _raw_url(self, path: str, branch: Optional[str] = None) -> str:
+        br = branch or self.cfg.branch
+        return f"https://raw.githubusercontent.com/{self.cfg.owner}/{self.cfg.repo}/{br}/{path}"
 
     def get_ref_sha(self, branch: Optional[str] = None) -> str:
         br = branch or self.cfg.branch
@@ -90,10 +96,6 @@ class GitHubRepoStore:
         return mapping[path]
 
     def get_blob_bytes(self, blob_sha: str) -> bytes:
-        """
-        Downloads exact blob content using Git Blobs API.
-        This is reliable for binary .keras files.
-        """
         r = requests.get(
             self._url(self._repo_path() + f"/git/blobs/{blob_sha}"),
             headers=self.headers,
@@ -108,17 +110,40 @@ class GitHubRepoStore:
         content_b64 = j.get("content", "").replace("\n", "")
         return base64.b64decode(content_b64)
 
+    def is_lfs_pointer_bytes(self, content: bytes) -> bool:
+        return content.startswith(self.LFS_POINTER_PREFIX)
+
     def get_raw_content(self, path: str, ref: Optional[str] = None) -> bytes:
         """
-        Resolve path -> blob sha -> exact bytes.
+        1) Read git blob bytes.
+        2) If blob is a Git LFS pointer, fallback to raw.githubusercontent URL.
+        3) Otherwise return blob bytes directly.
         """
         blob_sha = self.get_blob_sha(path, branch=ref)
-        return self.get_blob_bytes(blob_sha)
+        blob_bytes = self.get_blob_bytes(blob_sha)
+
+        if self.is_lfs_pointer_bytes(blob_bytes):
+            raw_url = self._raw_url(path, branch=ref)
+
+            # For public repos this usually works directly.
+            # For private repos raw.githubusercontent may ignore Authorization,
+            # so we try both with and without headers.
+            r = requests.get(raw_url, timeout=300)
+            if r.status_code == 200 and r.content and not self.is_lfs_pointer_bytes(r.content):
+                return r.content
+
+            r = requests.get(raw_url, headers={"Authorization": f"Bearer {self.cfg.token}"}, timeout=300)
+            r.raise_for_status()
+            if self.is_lfs_pointer_bytes(r.content):
+                raise ValueError(
+                    f"Git LFS pointer was downloaded instead of actual file for: {path}. "
+                    f"The model appears to be stored via Git LFS and raw download did not resolve the object."
+                )
+            return r.content
+
+        return blob_bytes
 
     def get_file_sha(self, path: str, ref: Optional[str] = None) -> str:
-        """
-        This is the contents/file SHA used by GitHub Contents API for delete/update.
-        """
         params = {}
         if ref:
             params["ref"] = ref
