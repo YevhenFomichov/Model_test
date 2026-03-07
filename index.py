@@ -172,10 +172,6 @@ def _cache_subdir_for_key(model_key: str) -> str:
 
 
 def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str) -> str:
-    """
-    Download GitHub model + matching json into local cache directory.
-    Returns local path to .keras model.
-    """
     cache_dir = _cache_subdir_for_key(model_key)
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -185,8 +181,10 @@ def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str) -> str:
     model_bytes = store.get_raw_content(model_key)
     with open(local_model_path, "wb") as f:
         f.write(model_bytes)
+        f.flush()
+        os.fsync(f.fileno())
 
-    if not os.path.exists(local_model_path):
+    if (not os.path.exists(local_model_path)) or os.path.getsize(local_model_path) == 0:
         raise FileNotFoundError(f"Failed to cache model locally: {local_model_path}")
 
     json_key = remote_json_key_for_model_key(model_key)
@@ -196,6 +194,8 @@ def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str) -> str:
         json_bytes = store.get_raw_content(json_key)
         with open(local_json_path, "wb") as f:
             f.write(json_bytes)
+            f.flush()
+            os.fsync(f.fileno())
 
     return local_model_path
 
