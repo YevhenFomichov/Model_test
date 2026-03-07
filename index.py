@@ -1,6 +1,6 @@
 import hashlib
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -39,6 +39,7 @@ MODEL_FOLDERS = [
 ]
 
 DEFAULT_INFERENCE_FOLDERS = MODEL_FOLDERS[:]
+REGISTRY_PATH = "model_registry.json"
 
 
 # -----------------------------
@@ -143,7 +144,7 @@ def _guess_streamlit_audio_mime(suffix: str) -> str:
 
 
 # -----------------------------
-# GitHub store
+# GitHub store / registry
 # -----------------------------
 def get_github_store() -> GitHubRepoStore:
     gh = st.secrets.get("github", None)
@@ -159,26 +160,67 @@ def get_github_store() -> GitHubRepoStore:
     return GitHubRepoStore(cfg)
 
 
-# -----------------------------
-# Matching json + remote cache
-# -----------------------------
-def remote_json_key_for_model_key(model_key: str) -> str:
-    return model_key.replace(".keras", ".json")
+def bootstrap_registry(store: GitHubRepoStore) -> dict:
+    model_paths = store.list_files(suffix=".keras")
+    models = {}
+
+    for path in model_paths:
+        parts = path.split("/")
+        top_folder = parts[0] if len(parts) > 1 else "selected_models"
+        if top_folder not in MODEL_FOLDERS:
+            continue
+
+        json_path = path.replace(".keras", ".json")
+        has_json = store.exists(json_path)
+
+        models[path] = {
+            "category": top_folder,
+            "physical_path": path,
+            "json_path": json_path if has_json else None,
+            "name": os.path.basename(path),
+        }
+
+    return {"version": 1, "models": models}
 
 
+def load_registry(store: GitHubRepoStore) -> dict:
+    if store.exists(REGISTRY_PATH):
+        reg = store.read_json(REGISTRY_PATH)
+        if "models" in reg:
+            return reg
+    return bootstrap_registry(store)
+
+
+def save_registry(store: GitHubRepoStore, registry: dict, message: str):
+    store.write_json(REGISTRY_PATH, registry, message=message, branch=store.cfg.branch)
+
+
+def get_models_by_categories(registry: dict, categories: List[str]) -> List[str]:
+    out = []
+    for model_key, meta in registry.get("models", {}).items():
+        if meta.get("category") in categories:
+            out.append(model_key)
+    return sorted(set(out))
+
+
+# -----------------------------
+# Remote cache
+# -----------------------------
 def _cache_subdir_for_key(model_key: str) -> str:
     h = hashlib.sha1(model_key.encode("utf-8")).hexdigest()[:12]
     return os.path.join(REMOTE_CACHE_DIR, h)
 
 
-def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str) -> str:
+def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str, registry: dict) -> str:
+    meta = registry["models"][model_key]
+    physical_path = meta["physical_path"]
+    json_path = meta.get("json_path")
+
     cache_dir = _cache_subdir_for_key(model_key)
     os.makedirs(cache_dir, exist_ok=True)
 
-    model_name = os.path.basename(model_key)
-    local_model_path = os.path.join(cache_dir, model_name)
-
-    model_bytes = store.get_raw_content(model_key)
+    local_model_path = os.path.join(cache_dir, os.path.basename(physical_path))
+    model_bytes = store.get_raw_content(physical_path)
     with open(local_model_path, "wb") as f:
         f.write(model_bytes)
         f.flush()
@@ -187,11 +229,9 @@ def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str) -> str:
     if (not os.path.exists(local_model_path)) or os.path.getsize(local_model_path) == 0:
         raise FileNotFoundError(f"Failed to cache model locally: {local_model_path}")
 
-    json_key = remote_json_key_for_model_key(model_key)
-    if store.exists(json_key):
-        json_name = os.path.basename(json_key)
-        local_json_path = os.path.join(cache_dir, json_name)
-        json_bytes = store.get_raw_content(json_key)
+    if json_path and store.exists(json_path):
+        local_json_path = os.path.join(cache_dir, os.path.basename(json_path))
+        json_bytes = store.get_raw_content(json_path)
         with open(local_json_path, "wb") as f:
             f.write(json_bytes)
             f.flush()
@@ -201,20 +241,13 @@ def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str) -> str:
 
 
 # -----------------------------
-# Remote listing + local loading
+# Loading models
 # -----------------------------
-def scan_remote_models_from_folders(store: GitHubRepoStore, folders: List[str]) -> List[str]:
-    out = []
-    for folder in folders:
-        prefix = f"{folder}/"
-        out.extend(store.list_files(prefix=prefix, suffix=".keras"))
-    return sorted(set(out))
-
-
 @st.cache_resource(show_spinner=False)
-def load_one_model_from_remote_key(model_key: str):
+def load_one_model_from_registry_key(model_key: str):
     store = get_github_store()
-    local_model_path = ensure_remote_model_cached(store, model_key)
+    registry = load_registry(store)
+    local_model_path = ensure_remote_model_cached(store, model_key, registry)
 
     for arch_name, mod in ARCH_MODULES.items():
         if hasattr(mod, "can_handle_model") and mod.can_handle_model(local_model_path):
@@ -222,6 +255,7 @@ def load_one_model_from_remote_key(model_key: str):
                 raise AttributeError(f"Module {mod.__name__} has no load_model_and_cfg")
             model, cfg = mod.load_model_and_cfg(local_model_path)
             return arch_name, model, cfg
+
     raise ValueError(f"No architecture handler found for: {os.path.basename(model_key)}")
 
 
@@ -230,16 +264,17 @@ def display_label_for_model(model_key: str) -> str:
 
 
 # -----------------------------
-# Streamlit app
+# App
 # -----------------------------
-st.set_page_config(page_title="Inhale inference + GitHub main commits", layout="wide")
+st.set_page_config(page_title="Inhale inference + safe logical moving", layout="wide")
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
 store = get_github_store()
+registry = load_registry(store)
 
 with st.sidebar:
-    st.header("GitHub model manager (direct commit to main)")
-    st.caption("This commits file moves directly into the main branch.")
+    st.header("Model manager (safe logical moving)")
+    st.caption("Categories are changed in model_registry.json. Model files are not physically moved.")
 
     entered_pwd = st.text_input("Admin password", type="password", key="admin_pwd")
     secret_pwd = st.secrets.get("ADMIN_MOVE_PASSWORD", None)
@@ -258,14 +293,8 @@ with st.sidebar:
         can_move = False
 
     enable_manager = st.checkbox(
-        "Enable moving models between folders",
+        "Enable moving models between categories",
         value=False,
-        disabled=(not can_move),
-    )
-
-    move_with_json = st.checkbox(
-        "Also move exact matching .json",
-        value=True,
         disabled=(not can_move),
     )
 
@@ -273,19 +302,19 @@ with st.sidebar:
     st.header("Inference")
 
     inference_folders = st.multiselect(
-        "Folders used for model testing",
+        "Categories used for model testing",
         options=MODEL_FOLDERS,
         default=DEFAULT_INFERENCE_FOLDERS,
     )
 
-    all_models_remote = scan_remote_models_from_folders(store, inference_folders)
-    if not all_models_remote:
-        st.error("No models found in selected inference folders.")
+    all_models = get_models_by_categories(registry, inference_folders)
+    if not all_models:
+        st.error("No models found in selected categories.")
         st.stop()
 
     chosen = st.multiselect(
         "Select up to 3 models",
-        options=all_models_remote,
+        options=all_models,
         format_func=display_label_for_model,
         max_selections=3,
     )
@@ -315,82 +344,54 @@ with st.sidebar:
     )
 
 # -----------------------------
-# Direct GitHub move UI
+# Logical move UI
 # -----------------------------
 if enable_manager and can_move:
-    st.subheader("Move models in GitHub (direct commit to main)")
+    st.subheader("Move models between categories safely")
 
     c1, c2 = st.columns(2)
     with c1:
         src_folder = st.selectbox(
-            "Source folder",
+            "Source category",
             options=MODEL_FOLDERS,
             index=MODEL_FOLDERS.index("selected_models"),
             key="src_folder",
         )
     with c2:
         dst_folder = st.selectbox(
-            "Destination folder",
+            "Destination category",
             options=MODEL_FOLDERS,
             index=MODEL_FOLDERS.index("tested_models"),
             key="dst_folder",
         )
 
-    src_models_remote = scan_remote_models_from_folders(store, [src_folder])
+    src_models = get_models_by_categories(registry, [src_folder])
 
-    if not src_models_remote:
-        st.info(f"No .keras files found in {src_folder}/ on GitHub")
+    if not src_models:
+        st.info(f"No models in category {src_folder}")
     else:
         selected_files = st.multiselect(
-            "Select .keras files to move",
-            options=src_models_remote,
+            "Select models to move",
+            options=src_models,
             format_func=lambda k: os.path.basename(k),
         )
 
         if st.button(
-            "Move selected directly to main",
+            "Move selected safely",
             type="primary",
             disabled=(len(selected_files) == 0 or src_folder == dst_folder),
         ):
-            moved = []
-            failed = []
-
             for model_key in selected_files:
-                base = os.path.basename(model_key)
-                dst_key = f"{dst_folder}/{base}"
+                registry["models"][model_key]["category"] = dst_folder
 
-                try:
-                    store.move_file(
-                        src_path=model_key,
-                        dst_path=dst_key,
-                        message_prefix=f"Move model {base}",
-                        branch=store.cfg.branch,
-                        overwrite=False,
-                    )
-                    moved.append(base)
-
-                    if move_with_json:
-                        json_key = remote_json_key_for_model_key(model_key)
-                        if store.exists(json_key):
-                            json_base = os.path.basename(json_key)
-                            dst_json_key = f"{dst_folder}/{json_base}"
-                            store.move_file(
-                                src_path=json_key,
-                                dst_path=dst_json_key,
-                                message_prefix=f"Move json {json_base}",
-                                branch=store.cfg.branch,
-                                overwrite=False,
-                            )
-
-                except Exception as e:
-                    failed.append(f"{base}: {type(e).__name__}: {e}")
+            save_registry(
+                store,
+                registry,
+                message=f"Update model categories: {src_folder} -> {dst_folder}",
+            )
 
             st.cache_resource.clear()
-
-            if moved:
-                st.success("Committed to main:\n" + "\n".join(moved))
-            if failed:
-                st.error("Failed:\n" + "\n".join(failed))
+            st.success("Categories updated safely in model_registry.json")
 
     st.divider()
 
@@ -414,7 +415,7 @@ errors = []
 for model_key in chosen:
     label = display_label_for_model(model_key)
     try:
-        arch_name, model, cfg = load_one_model_from_remote_key(model_key)
+        arch_name, model, cfg = load_one_model_from_registry_key(model_key)
         bundle[label] = (arch_name, model, cfg)
     except Exception as e:
         errors.append(f"{label}: {type(e).__name__}: {e}")
