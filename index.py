@@ -1,4 +1,3 @@
-import glob
 import hashlib
 import os
 from typing import Dict, List, Optional, Tuple
@@ -183,15 +182,18 @@ def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str) -> str:
     model_name = os.path.basename(model_key)
     local_model_path = os.path.join(cache_dir, model_name)
 
-    model_bytes, _ = store.get_content(model_key)
+    model_bytes = store.get_raw_content(model_key)
     with open(local_model_path, "wb") as f:
         f.write(model_bytes)
+
+    if not os.path.exists(local_model_path):
+        raise FileNotFoundError(f"Failed to cache model locally: {local_model_path}")
 
     json_key = remote_json_key_for_model_key(model_key)
     if store.exists(json_key):
         json_name = os.path.basename(json_key)
         local_json_path = os.path.join(cache_dir, json_name)
-        json_bytes, _ = store.get_content(json_key)
+        json_bytes = store.get_raw_content(json_key)
         with open(local_json_path, "wb") as f:
             f.write(json_bytes)
 
