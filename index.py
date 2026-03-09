@@ -199,19 +199,48 @@ def get_registry() -> dict:
     return st.session_state["model_registry"]
 
 
-def save_registry(registry: dict, message: str):
-    store = get_github_store()
-    store.write_json(REGISTRY_PATH, registry, message=message, branch=store.cfg.branch)
+def refresh_registry_from_remote() -> dict:
+    st.cache_data.clear()
+    fresh = load_registry_from_remote()
+    st.session_state["model_registry"] = fresh
+    return fresh
 
+
+def get_registry_sha() -> str | None:
+    if "model_registry_sha" not in st.session_state:
+        store = get_github_store()
+        st.session_state["model_registry_sha"] = (
+            store.get_file_sha(REGISTRY_PATH, ref=store.cfg.branch)
+            if store.exists(REGISTRY_PATH, ref=store.cfg.branch)
+            else None
+        )
+    return st.session_state["model_registry_sha"]
+
+
+def refresh_registry_sha() -> str | None:
+    store = get_github_store()
+    sha = (
+        store.get_file_sha(REGISTRY_PATH, ref=store.cfg.branch)
+        if store.exists(REGISTRY_PATH, ref=store.cfg.branch)
+        else None
+    )
+    st.session_state["model_registry_sha"] = sha
+    return sha
+
+
+def save_registry(registry: dict, message: str, expected_sha: str | None):
+    store = get_github_store()
+    store.write_json(
+        REGISTRY_PATH,
+        registry,
+        message=message,
+        branch=store.cfg.branch,
+        expected_sha=expected_sha,
+    )
     st.session_state["model_registry"] = registry
     st.cache_data.clear()
     st.cache_resource.clear()
-
-
-def refresh_registry_from_remote():
-    st.cache_data.clear()
-    st.cache_resource.clear()
-    st.session_state["model_registry"] = load_registry_from_remote()
+    refresh_registry_sha()
 
 
 def get_models_by_categories(registry: dict, categories: List[str]) -> List[str]:
@@ -220,6 +249,101 @@ def get_models_by_categories(registry: dict, categories: List[str]) -> List[str]
         if meta.get("category") in categories:
             out.append(model_key)
     return sorted(set(out))
+
+
+def build_conflict_rows(
+    old_registry: dict,
+    new_registry: dict,
+    requested_model_keys: List[str],
+    requested_dst_category: str,
+) -> pd.DataFrame:
+    rows = []
+    old_models = old_registry.get("models", {})
+    new_models = new_registry.get("models", {})
+    requested = set(requested_model_keys)
+
+    keys = sorted(set(old_models.keys()) | set(new_models.keys()))
+    for key in keys:
+        old_cat = old_models.get(key, {}).get("category")
+        new_cat = new_models.get(key, {}).get("category")
+
+        if old_cat != new_cat or key in requested:
+            rows.append({
+                "model": os.path.basename(key),
+                "you_requested_change": key in requested,
+                "your_requested_category": requested_dst_category if key in requested else None,
+                "old_category_seen_by_you": old_cat,
+                "current_remote_category": new_cat,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def apply_category_update_safely(model_keys: List[str], dst_category: str, message: str) -> dict:
+    expected_sha = get_registry_sha()
+    session_registry = get_registry()
+    latest = refresh_registry_from_remote()
+
+    if "models" not in latest:
+        latest = {"version": 1, "models": {}}
+
+    updated = {
+        "version": latest.get("version", 1),
+        "models": {k: dict(v) for k, v in latest["models"].items()},
+    }
+
+    for model_key in model_keys:
+        if model_key not in updated["models"]:
+            raise KeyError(f"Model not found in latest registry: {model_key}")
+        updated["models"][model_key]["category"] = dst_category
+
+    try:
+        save_registry(updated, message=message, expected_sha=expected_sha)
+        return updated
+    except RuntimeError as e:
+        current_remote = refresh_registry_from_remote()
+        current_sha = refresh_registry_sha()
+
+        st.session_state["pending_conflict"] = {
+            "model_keys": list(model_keys),
+            "dst_category": dst_category,
+            "message": message,
+            "expected_sha": expected_sha,
+            "current_sha": current_sha,
+            "old_registry": session_registry,
+            "remote_registry": current_remote,
+            "conflict_rows": build_conflict_rows(
+                session_registry,
+                current_remote,
+                model_keys,
+                dst_category,
+            ).to_dict(orient="records"),
+            "error_text": str(e),
+        }
+        raise
+
+
+def retry_pending_conflict_override() -> dict:
+    pending = st.session_state.get("pending_conflict")
+    if not pending:
+        raise RuntimeError("No pending conflict")
+
+    latest = refresh_registry_from_remote()
+    latest_sha = refresh_registry_sha()
+
+    updated = {
+        "version": latest.get("version", 1),
+        "models": {k: dict(v) for k, v in latest["models"].items()},
+    }
+
+    for model_key in pending["model_keys"]:
+        if model_key not in updated["models"]:
+            raise KeyError(f"Model not found in latest registry: {model_key}")
+        updated["models"][model_key]["category"] = pending["dst_category"]
+
+    save_registry(updated, message=pending["message"], expected_sha=latest_sha)
+    del st.session_state["pending_conflict"]
+    return updated
 
 
 # -----------------------------
@@ -231,6 +355,9 @@ def _cache_subdir_for_key(model_key: str) -> str:
 
 
 def ensure_remote_model_cached(store: GitHubRepoStore, model_key: str, registry: dict) -> str:
+    if model_key not in registry["models"]:
+        raise KeyError(f"Model missing in registry: {model_key}")
+
     meta = registry["models"][model_key]
     physical_path = meta["physical_path"]
     json_path = meta.get("json_path")
@@ -289,6 +416,36 @@ st.set_page_config(page_title="Inhale inference + safe logical moving", layout="
 st.title("Inhale inference: waveform + dose/flow predictions (≤3 models)")
 
 registry = get_registry()
+_ = get_registry_sha()
+
+pending = st.session_state.get("pending_conflict")
+if pending:
+    st.warning("model_registry.json изменился, пока у тебя была открыта старая версия.")
+    if pending.get("error_text"):
+        st.caption(pending["error_text"])
+
+    conflict_df = pd.DataFrame(pending.get("conflict_rows", []))
+    if not conflict_df.empty:
+        st.markdown("### Изменения в реестре и твой запрос")
+        st.dataframe(conflict_df, use_container_width=True)
+    else:
+        st.info("Удалось обнаружить конфликт, но список изменений пуст.")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Принять новые изменения и повторить перенос", type="primary"):
+            try:
+                retry_pending_conflict_override()
+                st.success("Реестр обновлён до последней версии, перенос повторён.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Не удалось повторить перенос: {type(e).__name__}: {e}")
+    with c2:
+        if st.button("Отменить конфликт"):
+            del st.session_state["pending_conflict"]
+            refresh_registry_from_remote()
+            refresh_registry_sha()
+            st.rerun()
 
 with st.sidebar:
     st.header("Model manager (safe logical moving)")
@@ -330,7 +487,8 @@ with st.sidebar:
         key="inference_folders",
     )
 
-    all_models = get_models_by_categories(registry, inference_folders)
+    current_registry = get_registry()
+    all_models = get_models_by_categories(current_registry, inference_folders)
     if not all_models:
         st.error("No models found in selected categories.")
         st.stop()
@@ -386,7 +544,8 @@ if enable_manager and can_move:
             key="dst_folder",
         )
 
-    src_models = get_models_by_categories(registry, [src_folder])
+    current_registry = get_registry()
+    src_models = get_models_by_categories(current_registry, [src_folder])
 
     if not src_models:
         st.info(f"No models in category {src_folder}")
@@ -404,31 +563,27 @@ if enable_manager and can_move:
             disabled=(len(selected_files) == 0 or src_folder == dst_folder),
             key="move_selected_button",
         ):
-            new_registry = {
-                "version": registry.get("version", 1),
-                "models": {k: dict(v) for k, v in registry["models"].items()},
-            }
+            try:
+                apply_category_update_safely(
+                    model_keys=selected_files,
+                    dst_category=dst_folder,
+                    message=f"Update model categories: {src_folder} -> {dst_folder}",
+                )
 
-            for model_key in selected_files:
-                new_registry["models"][model_key]["category"] = dst_folder
+                st.session_state["chosen_models"] = []
+                st.session_state["move_selected_files"] = []
 
-            save_registry(
-                new_registry,
-                message=f"Update model categories: {src_folder} -> {dst_folder}",
-            )
+                current_folders = list(st.session_state.get("inference_folders", []))
+                if dst_folder not in current_folders:
+                    current_folders.append(dst_folder)
+                    st.session_state["inference_folders"] = current_folders
 
-            # reset widget selections so UI rebuilds cleanly
-            st.session_state["chosen_models"] = []
-            st.session_state["move_selected_files"] = []
-
-            # optional: if user filtered only by source category, auto-add destination too
-            current_folders = list(st.session_state.get("inference_folders", []))
-            if dst_folder not in current_folders:
-                current_folders.append(dst_folder)
-                st.session_state["inference_folders"] = current_folders
-
-            st.success("Categories updated safely in model_registry.json")
-            st.rerun()
+                st.success("Categories updated safely in model_registry.json")
+                st.rerun()
+            except RuntimeError:
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to update registry: {type(e).__name__}: {e}")
 
     st.divider()
 
