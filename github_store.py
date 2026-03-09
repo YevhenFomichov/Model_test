@@ -1,7 +1,7 @@
 import base64
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import requests
 
@@ -132,11 +132,41 @@ class GitHubRepoStore:
         r.raise_for_status()
         return r.json()
 
-    def write_json(self, path: str, obj: dict, message: str, branch: Optional[str] = None):
+    def write_json(
+        self,
+        path: str,
+        obj: dict,
+        message: str,
+        branch: Optional[str] = None,
+        expected_sha: Optional[str] = None,
+    ):
+        """
+        If expected_sha is provided, write succeeds only when remote sha matches it.
+        This prevents stale sessions from silently overwriting newer changes.
+        """
         branch = branch or self.cfg.branch
-        sha = self.get_file_sha(path, ref=branch) if self.exists(path, ref=branch) else None
+        exists_now = self.exists(path, ref=branch)
+
+        if exists_now:
+            current_sha = self.get_file_sha(path, ref=branch)
+            if expected_sha is not None and current_sha != expected_sha:
+                raise RuntimeError(
+                    f"Registry changed on remote. Expected sha={expected_sha}, current sha={current_sha}"
+                )
+            sha_to_use = current_sha
+        else:
+            if expected_sha is not None:
+                raise RuntimeError("Registry file does not exist remotely, but expected_sha was provided")
+            sha_to_use = None
+
         payload = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
-        return self.put_content(path=path, content_bytes=payload, message=message, branch=branch, sha=sha)
+        return self.put_content(
+            path=path,
+            content_bytes=payload,
+            message=message,
+            branch=branch,
+            sha=sha_to_use,
+        )
 
     def read_json(self, path: str, ref: Optional[str] = None) -> dict:
         raw = self.get_raw_content(path, ref=ref)
